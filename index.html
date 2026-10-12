@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ポータル広場（テスト版）</title>
+<meta name="description" content="行きたい建物を選ぶと、スケボーに乗った棒人間が案内してくれる入口ページです。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ ゲームの画面 ============ -->
+<div id="stage" class="stage">
+
+  <!-- 上の帯：サイト名とボタン -->
+  <header class="topbar">
+    <h1 id="siteName" class="site-name">ポータル広場（テスト版）</h1>
+    <div class="topbar-buttons">
+      <button id="btnSound" type="button" class="btn btn-small" aria-pressed="true" aria-label="効果音の入／切">♪</button>
+      <button id="btnMap" type="button" class="btn" hidden>全体マップ</button>
+    </div>
+  </header>
+
+  <!-- 地図・フィールドを描く所 -->
+  <div class="view">
+    <canvas id="field" aria-label="フィールドの地図。建物を選ぶと、そこへ移動します"></canvas>
+
+    <!-- 初回だけ出す操作説明 -->
+    <p id="hint" class="hint" hidden>行きたい場所を選んでね</p>
+
+    <!-- はい／いいえ のメッセージ窓 -->
+    <div id="dialog" class="rpg-window dialog" role="dialog" aria-modal="true" aria-labelledby="dialogText" hidden>
+      <p id="dialogText" class="dialog-text"></p>
+      <div class="dialog-buttons">
+        <button id="btnYes" type="button" class="btn btn-yes">はい</button>
+        <button id="btnNo" type="button" class="btn btn-no">いいえ</button>
+      </div>
+    </div>
+
+    <!-- ゲームを表示できなかったときの案内 -->
+    <p id="broken" class="broken" hidden>ゲームを表示できませんでした。下のリンク一覧からお進みください。</p>
+  </div>
+
+  <!-- 下の帯：メッセージログ -->
+  <div id="log" class="rpg-window log" aria-live="polite"></div>
+
+  <!-- 建物に入るときの暗転 -->
+  <div id="fade" class="fade"></div>
+</div>
+
+<!-- ============ 通常のリンク一覧（ゲームが動かないとき用） ============ -->
+<section class="links" aria-labelledby="linksTitle">
+  <h2 id="linksTitle">リンク一覧</h2>
+  <p class="links-note">ゲームが動かないときは、こちらからどうぞ。</p>
+  <ul id="linkList" class="link-list"></ul>
+  <noscript>
+    <p class="links-note">このページは JavaScript を使っています。JavaScript を有効にすると、リンク一覧とゲームが表示されます。</p>
+  </noscript>
+</section>
+
+<script src="config.js"></script>
+<script>
+// リンク一覧を config.js の建物から作る（ゲーム本体が動かなくても、ここは表示される）
+(function () {
+  var list = document.getElementById("linkList");
+  CONFIG.buildings.forEach(function (b) {
+    var li = document.createElement("li");
+    var a = document.createElement("a");
+    a.href = b.url;
+    a.textContent = b.name;
+    li.appendChild(a);
+    if (b.desc) {
+      var s = document.createElement("span");
+      s.textContent = b.desc;
+      li.appendChild(s);
+    }
+    list.appendChild(li);
+  });
+})();
+</script>
+<script src="game.js"></script>
+<script>
+// ゲームを始められなかったとき（古いブラウザなど）は、地図の代わりに案内を出す
+if (!window.PORTAL_STARTED) {
+  document.getElementById("field").hidden = true;
+  document.getElementById("broken").hidden = false;
+}
+</script>
+</body>
+</html>

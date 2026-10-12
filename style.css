@@ -1,0 +1,242 @@
+/* ============================================================
+   ポータルサイトの見た目
+   ============================================================ */
+
+* { box-sizing: border-box; }
+
+/* hidden を付けた物は必ず消す（display を指定した部品でも効くように） */
+[hidden] { display: none !important; }
+
+html, body { margin: 0; }
+
+body {
+  background: #1b2440;
+  color: #fff;
+  font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", system-ui, sans-serif;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ---------- ゲームの画面（1画面ぶんの高さ） ---------- */
+.stage {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto 1fr auto;   /* 上の帯／地図／ログ */
+  height: 100vh;
+  height: 100svh;                      /* スマホのアドレスバーを除いた高さ */
+  min-height: 420px;
+  overflow: hidden;
+  background: #a9dcf2;
+}
+
+/* ---------- 上の帯 ---------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 56px;
+  padding: 6px 10px;
+  background: #1a2452;
+  border-bottom: 3px solid #f3f0e2;
+}
+
+.site-name {
+  margin: 0;
+  font-size: clamp(14px, 4vw, 19px);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-buttons {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+/* ---------- ボタン ---------- */
+.btn {
+  min-height: 44px;                    /* 指で押しやすい高さ */
+  padding: 6px 16px;
+  border: 2px solid #f3f0e2;
+  border-radius: 8px;
+  background: #2c3a7a;
+  color: #fff;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.btn:hover { background: #3b4c9c; }
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible { outline: 3px solid #ffd84a; outline-offset: 2px; }
+
+.btn-small { min-width: 44px; padding: 6px 10px; }
+.btn-small[aria-pressed="false"] {     /* 音を切っているとき */
+  background: #55586a;
+  color: #b9bccb;
+  text-decoration: line-through;
+}
+
+/* ---------- 地図・フィールド ---------- */
+.view {
+  position: relative;
+  min-height: 0;
+}
+
+#field {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: manipulation;          /* 指でページを上下に動かせるまま、ダブルタップ拡大は止める */
+}
+
+/* ---------- RPG風の窓（共通） ---------- */
+.rpg-window {
+  background: rgba(20, 28, 72, 0.94);
+  border: 3px solid #f3f0e2;
+  border-radius: 10px;
+  box-shadow: 0 0 0 2px #1a2452, 0 6px 16px rgba(0, 0, 0, 0.35);
+}
+
+/* ---------- はい／いいえ の窓 ---------- */
+.dialog {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  width: min(92%, 440px);
+  transform: translateX(-50%);
+  padding: 14px 16px 16px;
+}
+
+.dialog-text {
+  margin: 0 0 12px;
+  font-size: clamp(16px, 4.4vw, 19px);
+  font-weight: 700;
+  text-align: center;
+}
+
+.dialog-buttons {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+}
+.dialog-buttons .btn {
+  flex: 1;
+  max-width: 160px;
+  min-height: 48px;
+  font-size: 17px;
+}
+.btn-yes { background: #c8512b; }
+.btn-yes:hover { background: #dd6238; }
+
+/* ---------- 初回の操作説明 ---------- */
+.hint {
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: #fff8dc;
+  color: #3a2a1a;
+  border: 3px solid #e2703a;
+  font-size: clamp(15px, 4.2vw, 18px);
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+  animation: hint-bob 1.4s ease-in-out infinite;
+}
+@keyframes hint-bob {
+  0%, 100% { transform: translate(-50%, 0); }
+  50%      { transform: translate(-50%, 5px); }
+}
+
+/* ---------- ゲームを表示できなかったとき ---------- */
+.broken {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #1b2440;
+  font-weight: 700;
+  text-align: center;
+}
+
+/* ---------- メッセージログ ---------- */
+.log {
+  margin: 0;
+  padding: 8px 14px;
+  min-height: calc(3 * 1.5em + 22px);  /* 3行ぶん */
+  border-radius: 0;
+  border-width: 3px 0 0;
+  box-shadow: none;
+  font-size: clamp(13px, 3.7vw, 15px);
+}
+.log p { margin: 0; }
+.log p.old { color: #9aa3cf; }         /* 古い行は薄く */
+.log p::before { content: "▸ "; }
+
+/* ---------- 建物に入るときの暗転 ---------- */
+.fade {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.6s ease;
+  z-index: 10;
+}
+.fade.on {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ---------- 通常のリンク一覧 ---------- */
+.links {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 16px 40px;
+}
+.links h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+}
+.links-note {
+  margin: 0 0 14px;
+  color: #b9c0e3;
+  font-size: 14px;
+}
+.link-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.link-list li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 12px 14px;
+  background: #26315e;
+  border-radius: 8px;
+}
+.link-list a {
+  color: #ffd84a;
+  font-size: 17px;
+  font-weight: 700;
+}
+.link-list span {
+  color: #cfd5f0;
+  font-size: 14px;
+}
