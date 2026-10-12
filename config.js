@@ -12,7 +12,7 @@ var CONFIG = {
   // 建物（ここに1つ足すと、地図・看板・リンク一覧に自動で増えます）
   // ------------------------------------------------------------
   //   name      : 建物の名前（地図のラベル・メッセージ・リンク一覧に出ます）
-  //   sign      : 看板の文字（短く）
+  //   sign      : 看板の文字（移動画面の建物の上に出ます。name と同じ名前にそろえてあります）
   //   desc      : リンク一覧に添える説明（無くても動きます）
   //   url       : 入ったときに開くサイト
   //   x, y      : 建物の左上のマス（地図の左上が x=0, y=0。右へ x、下へ y）
@@ -23,32 +23,32 @@ var CONFIG = {
   //   roofColor : 屋根の色（#rrggbb の形で書きます）
   buildings: [
     {
-      name: "占い屋",
-      sign: "占い",
+      name: "占いルーム",
+      sign: "占いルーム",
       desc: "☆ねこ占ぽ",
       url: "https://uranai-yakata.netlify.app/",
       x: 2, y: 3, size: 3, door: "S",
       wallColor: "#d9c8f0", roofColor: "#6a4bb0"
     },
     {
-      name: "食事案内所",
-      sign: "ごはん",
+      name: "食事提案処",
+      sign: "食事提案処",
       desc: "毎日の晩御飯の提案",
       url: "https://bangohan-teian.netlify.app/",
       x: 11, y: 3, size: 3, door: "S",
       wallColor: "#fbe3bd", roofColor: "#e2703a"
     },
     {
-      name: "FX案内所",
-      sign: "FX",
+      name: "EA紹介所",
+      sign: "EA紹介所",
       desc: "FXのページ",
       url: "https://sumi-fx-lab.netlify.app/",
       x: 5, y: 10, size: 3, door: "E",
       wallColor: "#d5e4f5", roofColor: "#2f6db5"
     },
     {
-      name: "画像屋",
-      sign: "画像",
+      name: "画像生成小屋",
+      sign: "画像生成小屋",
       desc: "画風コピペシート",
       url: "https://gafu-copy.netlify.app/",
       x: 11, y: 14, size: 3, door: "S",

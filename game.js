@@ -427,6 +427,12 @@
     };
   }
 
+  // 看板の横幅の半分（文字数で変わる。描くときと、押した場所の判定の両方で使う）。文字の大きさもここで決める
+  function signHalfWidth(b) {
+    ctx.font = "bold 16px " + FONT;
+    return (ctx.measureText(b.sign || b.name).width + 20) / 2;
+  }
+
   // 主人公の体の寸法（px）。数字を変えると体つきが変わる
   const BODY = {
     leg: 11.5,       // もも・すねの長さ
@@ -764,10 +770,9 @@
 
       // 看板（屋根のてっぺんに立てる）
       const text = b.sign || b.name;
-      ctx.font = "bold 16px " + FONT;
+      const w = signHalfWidth(b) * 2, h = 26;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      const w = ctx.measureText(text).width + 20, h = 26;
       const sx = apex.x, sy = apex.y - 17;                          // 看板の中心
       ctx.strokeStyle = shade(b.roofColor, -0.45);
       ctx.lineWidth = 3;
@@ -1190,7 +1195,7 @@
       const body = [                                    // 壁と屋根をまとめた外わく
         s.L, s.F, s.R, { x: s.R.x, y: s.R.y - BUILD.wallH }, s.rR, s.rB, s.rL, { x: s.L.x, y: s.L.y - BUILD.wallH }
       ];
-      const onSign = Math.abs(q.x - s.apex.x) < 40 && q.y > s.apex.y - 32 && q.y < s.apex.y;   // 看板
+      const onSign = Math.abs(q.x - s.apex.x) < signHalfWidth(b) && q.y > s.apex.y - 32 && q.y < s.apex.y;   // 看板
       if (!insidePoly(q, body) && !onSign) return;
       if (!hit || b.x + b.y + b.size > hit.x + hit.y + hit.size) hit = b;
     });
