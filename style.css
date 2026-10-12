@@ -96,6 +96,9 @@ body {
   touch-action: manipulation;          /* 指でページを上下に動かせるまま、ダブルタップ拡大は止める */
 }
 
+/* 移動画面では、指でなぞると地図が動く（ページ自体は動かさない） */
+#field.is-field { touch-action: none; }
+
 /* ---------- RPG風の窓（共通） ---------- */
 .rpg-window {
   background: rgba(20, 28, 72, 0.94);

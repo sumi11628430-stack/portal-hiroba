@@ -57,6 +57,7 @@
   const state = {
     screen: "overview",   // "overview"＝全体マップ ／ "field"＝移動画面
     dest: null,           // 向かっている（着いた）建物
+    goal: null,           // 向かっている先のマス（目的地の印を出す場所）
     selected: null,       // 全体マップで選んでいる建物（確認の窓が出ている間）
     time: 0,              // 始まってからの秒数（動きの計算に使う）
     leaving: false        // 建物に入って、サイトへ移る途中
@@ -198,8 +199,13 @@
 
   // マスの並びを、角を丸めた「なめらかな道のり」にする。
   // 角は、前後のマスの境目どうしを曲線でつなぐ（通るのは道順のマスの中だけ）。
-  function buildRoute(tiles) {
+  // startPos を渡すと、そこ（滑っている途中の位置）から始まる道のりにする。
+  function buildRoute(tiles, startPos) {
     const P = tiles.map(function (t) { return { x: t.x + 0.5, y: t.y + 0.5 }; });   // マスの中心
+    if (startPos) {
+      if (P.length === 1) P.unshift(startPos);          // 行き先が同じマスの中 → そのマスの中心へ
+      else P[0] = startPos;                             // いまの位置から、次のマスへなめらかにつなぐ
+    }
     const n = P.length;
     const pts = [P[0]];
     if (n === 2) {
@@ -395,6 +401,29 @@
     ctx.arcTo(x, y + h, x, y, r);
     ctx.arcTo(x, y, x + w, y, r);
     ctx.closePath();
+  }
+
+  // 建物の形（移動画面）。描くときと、押した場所の判定の両方で使う
+  const BUILD = {
+    wallH: 60,       // 壁の高さ
+    roofH: 36,       // 屋根の高さ
+    eave: 1.13       // ひさしの出ぐあい（1 で出っぱり無し）
+  };
+  function buildingShape(b) {
+    const s = b.size;
+    const Bk = iso(b.x, b.y);                           // 奥の角
+    const R = iso(b.x + s, b.y);                        // 右の角
+    const F = iso(b.x + s, b.y + s);                    // 手前の角
+    const L = iso(b.x, b.y + s);                        // 左の角
+    const cx = (Bk.x + F.x) / 2, cy = (Bk.y + F.y) / 2; // 建物の中心（地面）
+    const eave = function (P) {
+      return { x: cx + (P.x - cx) * BUILD.eave, y: cy + (P.y - cy) * BUILD.eave - BUILD.wallH };
+    };
+    return {
+      Bk: Bk, R: R, F: F, L: L,
+      rB: eave(Bk), rR: eave(R), rF: eave(F), rL: eave(L),          // 屋根の四隅
+      apex: { x: cx, y: cy - BUILD.wallH - BUILD.roofH }            // 屋根のてっぺん
+    };
   }
 
   // 主人公の体の寸法（px）。数字を変えると体つきが変わる
@@ -700,13 +729,9 @@
 
     // 建物（壁2面＋屋根＋看板）
     isoBuilding: function (ctx, b) {
-      const s = b.size;
-      const hW = 60;                                    // 壁の高さ
-      const hR = 36;                                    // 屋根の高さ
-      const Bk = iso(b.x, b.y);                         // 奥の角
-      const R = iso(b.x + s, b.y);                      // 右の角
-      const F = iso(b.x + s, b.y + s);                  // 手前の角
-      const L = iso(b.x, b.y + s);                      // 左の角
+      const shape = buildingShape(b);
+      const hW = BUILD.wallH;
+      const R = shape.R, F = shape.F, L = shape.L;      // 右・手前・左の角（地面）
       const up = function (P, h) { return { x: P.x, y: P.y - h }; };
 
       // 壁2面（左手前は明るく、右手前は暗く）
@@ -730,10 +755,7 @@
       panel(sideFace, 0.60, 0.84, 22, 43, COLORS.window);
 
       // 屋根（とんがり屋根。ひさしの分だけ外へ広げる）
-      const cx = (Bk.x + F.x) / 2, cy = (Bk.y + F.y) / 2;           // 建物の中心（地面）
-      const eave = function (P) { return { x: cx + (P.x - cx) * 1.13, y: cy + (P.y - cy) * 1.13 - hW }; };
-      const rB = eave(Bk), rR = eave(R), rF = eave(F), rL = eave(L);
-      const apex = { x: cx, y: cy - hW - hR };
+      const rB = shape.rB, rR = shape.rR, rF = shape.rF, rL = shape.rL, apex = shape.apex;
       fillPoly(ctx, [rB, rL, apex], shade(b.roofColor, 0.22), COLORS.outline);   // 奥の2面
       fillPoly(ctx, [rB, rR, apex], shade(b.roofColor, 0.08), COLORS.outline);
       fillPoly(ctx, [rL, rF, apex], b.roofColor, COLORS.outline);               // 手前の2面
@@ -862,6 +884,7 @@
     mode: "idle",          // 動きの種類
     t: 0,                  // その動きが始まってからの秒数
     off: 1,                // 0＝板の上 〜 1＝板の横に立っている
+    offFrom: 1,            // 乗り降りを始めた時の off（途中からでも、なめらかに続けるため）
     route: null,           // なめらかな道のり
     dist: 0,               // 道のりを進んだ長さ
     kicks: 2,              // 蹴る回数
@@ -873,24 +896,55 @@
   function playerTile() { return { x: Math.floor(player.x), y: Math.floor(player.y) }; }
   function isMoving() { return player.mode !== "idle"; }
 
-  // 移動を始める。tiles＝通るマスの並び、onArrive＝着いたときに呼ぶ処理
+  // 移動を始める。tiles＝通るマスの並び、onArrive＝着いたときに呼ぶ処理（無くてもよい）
+  // すでに滑っている途中なら、板から降りずに、いまの位置から新しい道のりへつなぐ。
   function startTrip(tiles, onArrive) {
     const p = player;
-    p.route = buildRoute(tiles);
-    p.dist = 0;
-    p.speed = 0;
-    p.onArrive = onArrive;
-    if (p.route.total < 0.01) {                         // もう着いている
+    const riding = p.mode === "push" || p.mode === "glide" || p.mode === "brake";
+    const route = buildRoute(tiles, riding ? { x: p.x, y: p.y } : null);
+    const full = C.walkSpeed * C.skateMultiplier;       // いちばん速いときの速さ
+    p.onArrive = onArrive || null;
+
+    if (!riding && route.total < 0.01) {                // もう着いている（いま居る場所を選んだ）
       p.route = null;
-      p.onArrive = null;
-      setMode("idle");
-      onArrive();
+      if (p.mode === "idle") {
+        p.onArrive = null;
+        if (onArrive) onArrive();
+      } else {                                          // 乗りかけ・降りかけの途中なら、降りてから着いた扱いにする
+        p.offFrom = p.off;
+        setMode("dismount");
+      }
       return;
     }
-    const short = p.route.total <= 2.5;                 // 近いときは、蹴るのは1回・速さも控えめ
+
+    p.route = route;
+    p.dist = 0;
+
+    if (riding) {
+      // 滑っている途中の行き先変更
+      p.vmax = full;
+      if (route.total > 0.01) {
+        const turn = Math.abs(angDiff(routeAt(route, 0).ang, p.heading));
+        if (turn > 2.0) p.speed *= 0.3;                 // ほぼ逆向き：速さを大きく落として向きを変える
+        else if (turn > 1.0) p.speed *= 0.6;            // 横向き：少し落とす
+      }
+      if (p.speed < full * 0.8) {                       // 遅くなっていたら、もう一度蹴って加速する
+        p.kicks = p.speed < full * 0.4 ? 2 : 1;
+        p.kickNo = -1;
+        setMode("push");
+      } else {
+        setMode("glide");
+      }
+      return;
+    }
+
+    // 立っている所から出発
+    const short = route.total <= 2.5;                   // 近いときは、蹴るのは1回・速さも控えめ
     p.kicks = short ? 1 : 2;
     p.kickNo = -1;
-    p.vmax = C.walkSpeed * C.skateMultiplier * (short ? 0.6 : 1);
+    p.speed = 0;
+    p.vmax = full * (short ? 0.6 : 1);
+    p.offFrom = p.off;
     setMode("mount");
   }
 
@@ -923,7 +977,7 @@
     if (p.mode === "mount") {                           // 板に乗る（進む向きへ体を向ける）
       const k = clamp(p.t / T_MOUNT, 0, 1);
       const a0 = routeAt(p.route, 0).ang;
-      p.off = 1 - ease(k);
+      p.off = p.offFrom * (1 - ease(k));
       p.heading += angDiff(a0, p.heading) * (1 - Math.exp(-dt * 14));
       if (k >= 1) { p.off = 0; p.heading = a0; setMode("push"); }
       return;
@@ -931,7 +985,7 @@
 
     if (p.mode === "dismount") {                        // 板から降りる
       const k = clamp(p.t / T_DISMOUNT, 0, 1);
-      p.off = ease(k);
+      p.off = lerp(p.offFrom, 1, ease(k));
       p.lean *= Math.exp(-dt * 8);
       if (k >= 1) {
         const done = p.onArrive;
@@ -976,7 +1030,7 @@
     p.y = q.y;
 
     // 向きは道のりの向きを少し遅れて追いかける。その遅れ（＝曲がり具合）で体を傾ける
-    const lag = angDiff(q.ang, p.heading);
+    const lag = p.route.total > 0.01 ? angDiff(q.ang, p.heading) : 0;
     p.heading += lag * (1 - Math.exp(-dt * 16));
     const leanTo = clamp(lag * 2.6, -1, 1) * clamp(p.speed / (p.vmax * 0.5), 0, 1);
     const rate = Math.abs(leanTo) > Math.abs(p.lean) ? 14 : 4.5;     // 傾くのは速く、戻るのはゆっくり
@@ -993,6 +1047,7 @@
       p.speed = 0;
       Sound.setRoll(0, true);
       Sound.brake();
+      p.offFrom = 0;
       setMode("dismount");
     }
   }
@@ -1074,9 +1129,11 @@
 
   // ---- 移動画面（斜め見下ろし） ----
 
-  const cam = { x: player.x, y: player.y };             // カメラが見ている地図の位置
+  // カメラが見ている地図の位置。free＝手で画面を動かした後（主人公の追いかけを止めている間）
+  const cam = { x: player.x, y: player.y, free: false };
 
   function updateCamera(dt) {
+    if (cam.free) return;                               // 手で動かした後は、次に行き先を選ぶまで追いかけない
     const k = 1 - Math.exp(-dt * 7);                    // 主人公を少し遅れて追いかける
     cam.x += (player.x - cam.x) * k;
     cam.y += (player.y - cam.y) * k;
@@ -1085,6 +1142,58 @@
   // 画面の大きさに合わせた拡大率
   function fieldZoom() {
     return clamp(Math.min(viewW, viewH * 1.25) / 430, 0.85, 1.8);
+  }
+
+  // 移動画面の表示の基準：z＝拡大率、(ox,oy)＝地図の原点が来る画面上の位置
+  function fieldView() {
+    const z = fieldZoom();
+    const c = iso(cam.x, cam.y);
+    return { z: z, ox: viewW / 2 - c.x * z, oy: viewH * 0.56 - c.y * z };   // カメラの位置を画面の中央（少し下）に合わせる
+  }
+
+  // 画面上の点 (px,py) を、斜め画面の座標に直す
+  function fieldToIso(px, py) {
+    const v = fieldView();
+    return { x: (px - v.ox) / v.z, y: (py - v.oy) / v.z };
+  }
+
+  // 斜め画面の座標を、地図の位置に直す（iso の逆）
+  function isoToWorld(q) {
+    return { x: (q.x / (TW / 2) + q.y / (TH / 2)) / 2, y: (q.y / (TH / 2) - q.x / (TW / 2)) / 2 };
+  }
+
+  // 画面を手で動かす。(dx,dy)＝見る場所を、画面の上でどれだけ動かすか（px）。地図の外までは行かない
+  function panCamera(dx, dy) {
+    const z = fieldZoom();
+    const d = isoToWorld({ x: dx / z, y: dy / z });
+    cam.x = clamp(cam.x + d.x, 0, COLS);
+    cam.y = clamp(cam.y + d.y, 0, ROWS);
+    cam.free = true;
+  }
+
+  // 点が多角形の中にあるか
+  function insidePoly(pt, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const a = poly[i], b = poly[j];
+      if ((a.y > pt.y) !== (b.y > pt.y) && pt.x < (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+    }
+    return inside;
+  }
+
+  // 移動画面の点 q（斜め画面の座標）にある建物（無ければ null）。重なっていたら手前の建物
+  function buildingAtIso(q) {
+    let hit = null;
+    BUILDINGS.forEach(function (b) {
+      const s = buildingShape(b);
+      const body = [                                    // 壁と屋根をまとめた外わく
+        s.L, s.F, s.R, { x: s.R.x, y: s.R.y - BUILD.wallH }, s.rR, s.rB, s.rL, { x: s.L.x, y: s.L.y - BUILD.wallH }
+      ];
+      const onSign = Math.abs(q.x - s.apex.x) < 40 && q.y > s.apex.y - 32 && q.y < s.apex.y;   // 看板
+      if (!insidePoly(q, body) && !onSign) return;
+      if (!hit || b.x + b.y + b.size > hit.x + hit.y + hit.size) hit = b;
+    });
+    return hit;
   }
 
   // 高さのある物（木・建物）。奥から順に描くための並び順の値（key）を持たせる。
@@ -1102,11 +1211,8 @@
     ctx.fillStyle = COLORS.sky;
     ctx.fillRect(0, 0, viewW, viewH);
 
-    // カメラの位置を画面の中央（少し下）に合わせる
-    const z = fieldZoom();
-    const c = iso(cam.x, cam.y);
-    const ox = viewW / 2 - c.x * z;
-    const oy = viewH * 0.56 - c.y * z;
+    const v = fieldView();
+    const z = v.z, ox = v.ox, oy = v.oy;
     ctx.setTransform(dpr * z, 0, 0, dpr * z, dpr * ox, dpr * oy);
 
     // 画面に入っている範囲（斜め画面の座標）。外のマスは描かない
@@ -1126,10 +1232,7 @@
       const e = entranceOf(b);
       Art.isoMat(ctx, b, e.x, e.y);
     });
-    if (state.dest && isMoving()) {
-      const e = entranceOf(state.dest);
-      Art.isoGoal(ctx, e.x, e.y, now);
-    }
+    if (state.goal && isMoving()) Art.isoGoal(ctx, state.goal.x, state.goal.y, now);
 
     // 高さのある物と主人公を、奥（keyが小さい）から順に描く。
     // こうすると、主人公が建物や木の裏に回ったとき、手前の物に隠れる。
@@ -1219,10 +1322,12 @@
 
   // 画面を切り替える
   function showScreen(name) {
+    const changed = state.screen !== name;
     state.screen = name;
     ui.btnMap.hidden = name !== "field";               // 「全体マップ」ボタンは移動画面だけ
-    canvas.style.cursor = "default";
-    if (name === "field") { cam.x = player.x; cam.y = player.y; }
+    canvas.classList.toggle("is-field", name === "field");   // 移動画面では、指でなぞって画面を動かせる（style.css）
+    canvas.style.cursor = name === "field" ? "grab" : "default";
+    if (name === "field" && changed) { cam.x = player.x; cam.y = player.y; cam.free = false; }
   }
 
   // ページを下へ動かしていたら、ゲームの画面が全部見える位置へ戻す
@@ -1241,28 +1346,67 @@
       function () { state.selected = null; });
   }
 
-  // 建物へ向かう（画面2へ切り替えて、移動開始）
+  // 建物へ向かう（全体マップからなら画面2へ切り替えて、移動開始）
   function goTo(b) {
-    Sound.unlock();                                     // 「はい」を押したこの時から、音が出せる
+    Sound.unlock();                                     // 押したこの時から、音が出せる
     const from = playerTile();
     const e = entranceOf(b);
     const tiles = findPath(from.x, from.y, e.x, e.y);
-    state.dest = b;
     showScreen("field");
+    cam.free = false;                                   // 画面を手で動かしていても、主人公を追いかけ直す
     if (!tiles) {
       addLog(b.name + "への道が見つかりません");
       return;
     }
-    addLog(b.name + "へ向かっています");
+    const sameGoal = state.dest === b && isMoving();    // 同じ行き先を続けて押した
+    state.dest = b;
+    state.goal = e;
+    if (tiles.length === 1 && player.mode === "idle") { // もう入口の前に立っている
+      askEnter(b);
+      return;
+    }
+    if (!sameGoal) addLog(b.name + "へ向かっています");
     startTrip(tiles, function () { arrive(b); });
+  }
+
+  // 道や草原のマスへ向かう（移動画面で地面を押したとき）
+  function goToTile(tx, ty) {
+    if (!isWalkable(tx, ty)) return;                    // 木・池・地図の外は、何もしない
+    for (let i = 0; i < BUILDINGS.length; i++) {        // 入口の前のマスなら、その建物へ向かう扱いにする
+      const e = entranceOf(BUILDINGS[i]);
+      if (e.x === tx && e.y === ty) { goTo(BUILDINGS[i]); return; }
+    }
+    Sound.unlock();
+    const from = playerTile();
+    const tiles = findPath(from.x, from.y, tx, ty);
+    if (!tiles) return;
+    cam.free = false;
+    state.dest = null;
+    state.goal = { x: tx, y: ty };
+    startTrip(tiles, null);
+  }
+
+  // 移動画面で押した場所へ向かう（建物なら入口へ、道や草原ならそのマスへ）
+  function tapField(px, py) {
+    const q = fieldToIso(px, py);
+    const b = buildingAtIso(q);
+    if (b) { goTo(b); return; }
+    const w = isoToWorld(q);
+    goToTile(Math.floor(w.x), Math.floor(w.y));
   }
 
   // 入口に着いた
   function arrive(b) {
+    cam.free = false;
     addLog(b.name + "に到着しました");
+    askEnter(b);
+  }
+
+  // 「入りますか？」を聞く
+  function askEnter(b) {
     ask(b.name + "に入りますか？",
       function () { enter(b); },
-      function () { addLog(b.name + "の前にいます。「全体マップ」で行き先を選べます"); });
+      function () { addLog(b.name + "の前にいます。行き先は、建物を押すか「全体マップ」で選べます"); });
   }
 
   // 建物に入る（暗転してから、同じタブでサイトへ移る）
@@ -1279,6 +1423,7 @@
     cancelTrip();
     closeDialog();
     state.dest = null;
+    state.goal = null;
     state.selected = null;
     showScreen("overview");
     addLog("行きたい建物を選んでください");
@@ -1291,18 +1436,62 @@
     return { x: ev.clientX - r.left, y: ev.clientY - r.top };
   }
 
-  canvas.addEventListener("click", function (ev) {
-    if (state.leaving || isAsking() || state.screen !== "overview") return;
-    const pt = pointOf(ev);
-    const b = buildingAtPoint(pt.x, pt.y);
-    if (b) chooseBuilding(b);
+  // なぞる操作の記録。moved＝押したまま大きく動かした（マウス6px・指10pxより大きい＝画面を動かす操作になった）
+  const drag = { on: false, moved: false, id: -1, x0: 0, y0: 0, x: 0, y: 0 };
+
+  canvas.addEventListener("pointerdown", function (ev) {
+    if (ev.pointerType === "mouse" && ev.button !== 0) return;      // マウスは左ボタンだけ
+    drag.on = true;
+    drag.moved = false;
+    drag.id = ev.pointerId;
+    drag.x0 = drag.x = ev.clientX;
+    drag.y0 = drag.y = ev.clientY;
   });
 
-  // パソコン：建物の上にマウスを置いたら、指の形にする
-  canvas.addEventListener("mousemove", function (ev) {
-    if (state.screen !== "overview") return;
+  canvas.addEventListener("pointermove", function (ev) {
+    if (drag.on && ev.pointerType === "mouse" && ev.buttons === 0) drag.on = false;   // 画面の外でボタンを離していた
+    if (drag.on && ev.pointerId === drag.id && state.screen === "field") {
+      const slop = ev.pointerType === "mouse" ? 6 : 10; // 指は少しぶれるので、広めに「押した」と見なす
+      if (!drag.moved && Math.hypot(ev.clientX - drag.x0, ev.clientY - drag.y0) > slop) {
+        drag.moved = true;
+        try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* 使えなくても動く */ }
+      }
+      if (drag.moved) {
+        panCamera(drag.x - ev.clientX, drag.y - ev.clientY);        // 指やマウスに、地面がついてくる
+        drag.x = ev.clientX;
+        drag.y = ev.clientY;
+        canvas.style.cursor = "grabbing";
+        return;
+      }
+    }
+    // パソコン：建物の上にマウスを置いたら、指の形にする
     const pt = pointOf(ev);
-    canvas.style.cursor = buildingAtPoint(pt.x, pt.y) ? "pointer" : "default";
+    if (state.screen === "overview") canvas.style.cursor = buildingAtPoint(pt.x, pt.y) ? "pointer" : "default";
+    else canvas.style.cursor = buildingAtIso(fieldToIso(pt.x, pt.y)) ? "pointer" : "grab";
+  });
+
+  canvas.addEventListener("pointerup", function (ev) {
+    if (ev.pointerId !== drag.id) return;
+    drag.on = false;
+    if (state.screen === "field") canvas.style.cursor = "grab";
+  });
+  canvas.addEventListener("pointercancel", function (ev) {
+    if (ev.pointerId !== drag.id) return;
+    drag.on = false;
+    drag.moved = false;
+  });
+
+  // 押した（なぞらずに離した）
+  canvas.addEventListener("click", function (ev) {
+    if (drag.moved) { drag.moved = false; return; }     // 画面を動かした直後は、押した扱いにしない
+    if (state.leaving || isAsking()) return;
+    const pt = pointOf(ev);
+    if (state.screen === "overview") {
+      const b = buildingAtPoint(pt.x, pt.y);
+      if (b) chooseBuilding(b);
+    } else {
+      tapField(pt.x, pt.y);
+    }
   });
 
   ui.btnYes.addEventListener("click", function () { answer(true); });
@@ -1316,10 +1505,28 @@
     showSoundState();
   });
 
-  // キーボード：窓が出ている間、Esc＝いいえ
+  // キーボード：窓が出ている間は Esc＝いいえ。移動画面では、矢印キーで画面を動かす
+  const PAN_KEYS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+  const PAN_SPEED = 560;                                // 矢印キーで画面が動く速さ（px／秒）
+  const keysDown = {};                                  // 押している矢印キー
   window.addEventListener("keydown", function (ev) {
-    if (isAsking() && ev.key === "Escape") answer(false);
+    if (isAsking() && ev.key === "Escape") { answer(false); return; }
+    if (state.screen === "field" && PAN_KEYS[ev.key] && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+      keysDown[ev.key] = true;
+      ev.preventDefault();                              // ページ自体が上下に動くのを止める
+    }
   });
+  window.addEventListener("keyup", function (ev) { delete keysDown[ev.key]; });
+  window.addEventListener("blur", function () {         // ほかの画面へ移ったら、押しっぱなしを解く
+    Object.keys(keysDown).forEach(function (k) { delete keysDown[k]; });
+  });
+
+  function panByKeys(dt) {
+    if (state.screen !== "field") return;
+    let dx = 0, dy = 0;
+    Object.keys(keysDown).forEach(function (k) { dx += PAN_KEYS[k][0]; dy += PAN_KEYS[k][1]; });
+    if (dx || dy) panCamera(dx * PAN_SPEED * dt, dy * PAN_SPEED * dt);
+  }
 
   // 別のタブへ移ったら、滑走音を止める
   document.addEventListener("visibilitychange", function () {
@@ -1338,6 +1545,7 @@
   function update(dt) {
     state.time += dt;
     updatePlayer(dt);
+    panByKeys(dt);
     updateCamera(dt);
   }
 
@@ -1382,7 +1590,12 @@
     pointOfBuilding: function (b) {                             // 全体マップで、建物の中心がある画面上の位置
       const L = overviewLayout(), r = canvas.getBoundingClientRect();
       return { x: r.left + L.ox + (b.x + b.size / 2) * L.s, y: r.top + L.oy + (b.y + b.size / 2) * L.s };
-    }
+    },
+    fieldPoint: function (wx, wy, h) {                          // 移動画面で、地図の位置（地面から高さ h）がある画面上の位置
+      const v = fieldView(), q = iso(wx, wy), r = canvas.getBoundingClientRect();
+      return { x: r.left + v.ox + q.x * v.z, y: r.top + v.oy + (q.y - (h || 0)) * v.z };
+    },
+    keysDown: keysDown
   };
 
   // 始められなかったときは、index.html の最後の処理が案内を出す（下のリンク一覧は使える）
