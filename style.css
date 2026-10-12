@@ -203,6 +203,54 @@ body {
   pointer-events: auto;
 }
 
+/* ---------- 建物の中（サイトを重ねて表示する） ---------- */
+.inside {
+  position: fixed;
+  inset: 0;
+  z-index: 5;                          /* 暗転（z-index 10）より下、ゲームの画面より上 */
+  display: flex;
+  flex-direction: column;
+  background: #f4f1e6;
+}
+.inside-bar {                          /* 上の帯：「外に戻る」ボタンと建物の名前 */
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 56px;
+  padding: 6px 10px;
+  background: #1a2452;
+  border-bottom: 3px solid #f3f0e2;
+}
+.btn-exit { background: #c8512b; flex: none; }
+.btn-exit:hover { background: #dd6238; }
+.inside-name {
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inside-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.inside-loading {                      /* サイトが出るまでの間だけ見える */
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  color: #1b2440;
+  font-weight: 700;
+}
+.inside-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
 /* ---------- 通常のリンク一覧 ---------- */
 .links {
   max-width: 640px;

@@ -60,7 +60,8 @@
     goal: null,           // 向かっている先のマス（目的地の印を出す場所）
     selected: null,       // 全体マップで選んでいる建物（確認の窓が出ている間）
     time: 0,              // 始まってからの秒数（動きの計算に使う）
-    leaving: false        // 建物に入って、サイトへ移る途中
+    leaving: false,       // 建物に出入りしている途中（暗転の間。ほかの操作を受けつけない）
+    inside: null          // いま中に入っている建物（入っていなければ null）
   };
 
   // ---- 小さな道具 ----
@@ -1258,7 +1259,8 @@
   const ui = {
     dialog: el("dialog"), dialogText: el("dialogText"), btnYes: el("btnYes"), btnNo: el("btnNo"),
     log: el("log"), btnMap: el("btnMap"), btnSound: el("btnSound"), hint: el("hint"),
-    fade: el("fade"), siteName: el("siteName"), broken: el("broken")
+    fade: el("fade"), siteName: el("siteName"), broken: el("broken"),
+    inside: el("inside"), insideBody: el("insideBody"), insideName: el("insideName"), btnExit: el("btnExit")
   };
 
   // 「はい／いいえ」を聞く窓
@@ -1409,13 +1411,64 @@
       function () { addLog(b.name + "の前にいます。行き先は、建物を押すか「全体マップ」で選べます"); });
   }
 
-  // 建物に入る（暗転してから、同じタブでサイトへ移る）
+  // 建物に入る（暗転してから、建物の中＝リンク先のサイトを表示する）
   function enter(b) {
+    const mode = b.open || C.enterMode || "inside";     // 入り方（config.js の enterMode。建物ごとの open が優先）
     state.leaving = true;
     addLog(b.name + "に入ります");
     stopBgm();
     ui.fade.classList.add("on");
-    setTimeout(function () { window.location.href = b.url; }, 700);
+    setTimeout(function () {
+      if (mode === "move") {                            // 同じタブでサイトそのものへ移る
+        window.location.href = b.url;
+        return;
+      }
+      openInside(b);                                    // このページの上に重ねて表示する
+      state.leaving = false;
+      ui.fade.classList.remove("on");
+    }, 700);
+  }
+
+  // 建物の中を開く：リンク先のサイトを、このページの上に重ねて表示する
+  function openInside(b) {
+    state.inside = b;
+    ui.insideName.textContent = b.name;
+    const frame = document.createElement("iframe");     // 毎回新しく作る（ブラウザの「戻る」の履歴を増やさないため）
+    frame.className = "inside-frame";
+    frame.title = b.name;
+    frame.setAttribute("allow", "autoplay; clipboard-write; geolocation; fullscreen");   // 音・コピー・現在地・全画面を、中のサイトでも使えるようにする
+    frame.src = b.url;
+    ui.insideBody.appendChild(frame);
+    ui.inside.hidden = false;
+    document.documentElement.style.overflow = "hidden"; // 後ろのページが動かないようにする
+    // ブラウザやスマホの「戻る」でも外に出られるよう、履歴に印を1つ足す
+    try {
+      if (!(history.state && history.state.portalInside)) history.pushState({ portalInside: true }, "");
+    } catch (e) { /* 履歴が使えなくても、「外に戻る」ボタンで出られる */ }
+    ui.btnExit.focus({ preventScroll: true });
+  }
+
+  // 建物の外に出る。byBack＝ブラウザの「戻る」で出たとき
+  function exitInside(byBack) {
+    const b = state.inside;
+    if (!b || state.leaving) return;
+    state.leaving = true;
+    ui.fade.classList.add("on");
+    setTimeout(function () {
+      const frame = ui.insideBody.querySelector("iframe");
+      if (frame) frame.remove();                        // サイトを閉じる（中で鳴っていた音も止まる）
+      ui.inside.hidden = true;
+      document.documentElement.style.overflow = "";
+      state.inside = null;
+      state.leaving = false;
+      ui.fade.classList.remove("on");
+      addLog(b.name + "から出ました");
+      playBgm();
+      // ボタンで出たときは、入るときに履歴へ足した印を消しておく
+      if (!byBack) {
+        try { if (history.state && history.state.portalInside) history.back(); } catch (e) { /* 消せなくても動きは変わらない */ }
+      }
+    }, 450);
   }
 
   // 「全体マップ」ボタン：いつでも画面1へ戻る
@@ -1510,6 +1563,7 @@
   const PAN_SPEED = 560;                                // 矢印キーで画面が動く速さ（px／秒）
   const keysDown = {};                                  // 押している矢印キー
   window.addEventListener("keydown", function (ev) {
+    if (state.inside) return;                           // 建物の中では、キーを横取りしない
     if (isAsking() && ev.key === "Escape") { answer(false); return; }
     if (state.screen === "field" && PAN_KEYS[ev.key] && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
       keysDown[ev.key] = true;
@@ -1533,7 +1587,11 @@
     if (document.hidden) Sound.setRoll(0, true);
   });
 
-  // リンク先からブラウザの「戻る」で帰ってきたとき、暗転を消して続きから遊べるようにする
+  // 建物の中：「外に戻る」ボタン、またはブラウザやスマホの「戻る」で外に出る
+  ui.btnExit.addEventListener("click", function () { exitInside(false); });
+  window.addEventListener("popstate", function () { if (state.inside) exitInside(true); });
+
+  // （入り方が "move" のとき）リンク先からブラウザの「戻る」で帰ってきたら、暗転を消して続きから遊べるようにする
   window.addEventListener("pageshow", function () {
     state.leaving = false;
     ui.fade.classList.remove("on");
@@ -1553,8 +1611,10 @@
   function frame(ms) {
     const dt = lastMs ? Math.min(0.05, (ms - lastMs) / 1000) : 0;   // 止まっていた後に飛ばないよう上限を付ける
     lastMs = ms;
-    update(dt);
-    render();
+    if (!state.inside) {                                // 建物の中にいる間は、後ろのゲームを止めておく（電池の節約）
+      update(dt);
+      render();
+    }
     requestAnimationFrame(frame);
   }
 
