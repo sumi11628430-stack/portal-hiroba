@@ -13,6 +13,8 @@ var CONFIG = {
   // ------------------------------------------------------------
   //   name      : 建物の名前（地図のラベル・メッセージ・リンク一覧に出ます）
   //   sign      : 看板の文字（移動画面の建物の上に出ます。name と同じ名前にそろえてあります）
+  //   art       : 建物の絵。"uranai"＝魔法使いの館 / "gohan"＝ビストロ / "ea"＝ガラスのビル / "gazou"＝アトリエ小屋
+  //               書かなければ「箱＋とんがり屋根」の建物になります（新しい建物を足すときは、書かなくて大丈夫）
   //   desc      : リンク一覧に添える説明（無くても動きます）
   //   url       : 入ったときに開くサイト
   //   x, y      : 建物の左上のマス（地図の左上が x=0, y=0。右へ x、下へ y）
@@ -25,6 +27,7 @@ var CONFIG = {
     {
       name: "占いルーム",
       sign: "占いルーム",
+      art: "uranai",
       desc: "☆ねこ占ぽ",
       url: "https://uranai-yakata.netlify.app/",
       x: 2, y: 3, size: 3, door: "S",
@@ -33,6 +36,7 @@ var CONFIG = {
     {
       name: "食事提案処",
       sign: "食事提案処",
+      art: "gohan",
       desc: "毎日の晩御飯の提案",
       url: "https://bangohan-teian.netlify.app/",
       x: 11, y: 3, size: 3, door: "S",
@@ -41,6 +45,7 @@ var CONFIG = {
     {
       name: "EA紹介所",
       sign: "EA紹介所",
+      art: "ea",
       desc: "FXのページ",
       url: "https://sumi-fx-lab.netlify.app/",
       x: 5, y: 10, size: 3, door: "E",
@@ -49,6 +54,7 @@ var CONFIG = {
     {
       name: "画像生成小屋",
       sign: "画像生成小屋",
+      art: "gazou",
       desc: "画風コピペシート",
       url: "https://gafu-copy.netlify.app/",
       x: 11, y: 14, size: 3, door: "S",
