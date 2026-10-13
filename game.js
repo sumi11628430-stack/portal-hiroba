@@ -140,6 +140,9 @@
         problems.push(b.name + " が地図からはみ出しています");
         return;
       }
+      const art = BUILDING_ART[b.art];
+      if (b.art && !art) problems.push(b.name + " の art「" + b.art + "」という絵はありません（箱の建物で表示します）");
+      if (art && art.door !== b.door) problems.push(b.name + " の絵は入口が \"" + art.door + "\" 向きです（door を \"" + art.door + "\" にしてください）");
       const e = entranceOf(b);
       if (!isWalkable(e.x, e.y)) problems.push(b.name + " の入口の前が通れません");
       else if (!findPath(C.start.x, C.start.y, e.x, e.y)) problems.push(b.name + " への道がつながっていません");
@@ -440,10 +443,10 @@
   //   draw(ctx, b, g, now) … 描く。b＝建物の設定、g＝土台の四隅 { Bk 奥, R 右, F 手前, L 左 }（地面の高さ・斜め画面のpx）、now＝秒
   //   signAt(g)            … 看板の中心の位置 { x, y }（draw の中で看板を出す場所と同じ）
   //   outline(g)           … 建物の輪郭をおおう多角形（点の並び）。押した場所の判定に使う
-  const BUILDING_ART = {};
+  const BUILDING_ART = Object.create(null);   // 元からの名前（constructor など）を持たない入れ物
 
   // 看板の丸い印。絵の名前 → 印の種類
-  const SIGN_ICONS = { uranai: "star", gohan: "meal", ea: "chart", gazou: "sparkle" };
+  const SIGN_ICONS = Object.assign(Object.create(null), { uranai: "star", gohan: "meal", ea: "chart", gazou: "sparkle" });
 
   // 星形の道すじ（n＝角の数、R＝外の半径、r＝内の半径）
   function signStarPath(ctx, x, y, R, r, n) {
@@ -682,7 +685,7 @@
       ];
     }
 
-    return { draw: draw, signAt: signAt, outline: outline };
+    return { draw: draw, signAt: signAt, outline: outline, door: "S" };   // door＝この絵の入口の向き
   })();
 
   // 食事提案処：オレンジと白のしま模様の日よけと、手前にパラソルのテラス席がある街角のビストロ
@@ -942,7 +945,7 @@
       ctx.beginPath(); ctx.arc(cp.x, cp.y - 11, 2, 0, Math.PI * 2); ctx.fillStyle = GOLD; ctx.fill(); ctx.stroke();
     }
 
-    return { draw: draw, signAt: signAt, outline: outline };
+    return { draw: draw, signAt: signAt, outline: outline, door: "S" };   // door＝この絵の入口の向き
   })();
 
   // EA紹介所：白いロビーの上に青いガラスの高層棟をのせたビル（チャート画面・屋上に金の右肩上がりの矢印）
@@ -976,8 +979,10 @@
       return [
         P(0.25, 3, 0), P(3, 3, 0), P(3, 0.25, 0), r,
         { x: e.x, y: lerp(r.y, k.y, t) },
-        P(T_A1, T_B0, TOWER_H), P(T_A0, T_B0, TOWER_H), P(T_A0, T_B1, TOWER_H),
-        P(T_A0, T_B1, LOBBY_H), P(0.25, 3, LOBBY_H)
+        P(T_A1, T_B0, TOWER_H),
+        (function () { const r = P((T_A0 + T_A1) / 2, (T_B0 + T_B1) / 2, TOWER_H); return { x: r.x + 27, y: r.y - 34 }; })(),   // 金の矢印の先
+        P(T_A0, T_B0, TOWER_H), P(T_A0, T_B1, TOWER_H),
+        P(T_A0, T_B1, LOBBY_H), P(0.1, 3, LOBBY_H + 3)
       ];
     }
 
@@ -1095,7 +1100,7 @@
       buildingSign(ctx, b, s.x, s.y, [P(2.72, 2.3, LOBBY_H), P(2.72, 1.35, LOBBY_H)]);
     }
 
-    return { draw: draw, signAt: signAt, outline: outline };
+    return { draw: draw, signAt: signAt, outline: outline, door: "E" };   // door＝この絵の入口の向き
   })();
 
   // 画像生成小屋：手前へ下がるピンクの片流れ屋根に大きな天窓と絵筆をのせた、板張りのアトリエ小屋
@@ -1109,7 +1114,15 @@
     const A0 = 0.15, A1 = 2.85, B0 = 0.1, B1 = 2.9;   // 壁の範囲
     const EA0 = -0.1, EA1 = 3.1, EB0 = 0, EB1 = 3.0;  // 屋根の範囲（土台の外へ出るのは 0.1 マスまで）
     const HE = 58, SLOPE = 8, FASCIA = 5;             // 手前の軒の高さ・1マスあたりの上がり・屋根の厚み
-    const SIGN_DX = -17, SIGN_H = 124, POST_DX = 36;   // 看板：土台の中心からの横ずれ・高さ・柱の間隔の半分
+    const SIGN_DX = -17, SIGN_H = 104, POST_DX = 36;   // 看板：土台の中心からの横ずれ・高さ・柱の間隔の半分（高くすると、奥の道を通る主人公の足元を隠す）
+    const BRUSH_A = 2.95, BRUSH_B = 0.9;               // 絵筆が立っている屋根の上の場所
+    const BRUSH_TILT = 0.22, BRUSH_SIZE = 1.2;         // 絵筆の傾き（右へ）と大きさ
+
+    // 絵筆の中の位置（u＝根元からの長さ、v＝横）→ 画面の位置。base＝柄の先が屋根に付く点
+    function brushPoint(base, u, v) {
+      const sn = Math.sin(BRUSH_TILT) * BRUSH_SIZE, cs = Math.cos(BRUSH_TILT) * BRUSH_SIZE;
+      return { x: base.x + u * sn + v * cs, y: base.y - u * cs + v * sn };
+    }
 
     // 屋根の高さ（b が小さい＝奥ほど高い）
     function roofH(bb) { return HE + (EB1 - bb) * SLOPE; }
@@ -1155,9 +1168,8 @@
 
     // 屋根の上の大きな絵筆（base＝柄の先が屋根に付く点。上へ 柄→金具→毛先 の順）
     function drawBrush(ctx, base) {
-      const OL = COLORS.outline, tilt = 0.22, size = 1.2, sn = Math.sin(tilt) * size, cs = Math.cos(tilt) * size;
-      // 絵筆の中の位置（u＝根元からの長さ、v＝横）→ 画面の位置
-      function B(u, v) { return { x: base.x + u * sn + v * cs, y: base.y - u * cs + v * sn }; }
+      const OL = COLORS.outline, tilt = BRUSH_TILT;
+      function B(u, v) { return brushPoint(base, u, v); }
       // 毛の形（根元からふくらんで、先が丸くとがる）
       function bristlePath() {
         const p0 = B(40, -7.5), c1 = B(45, -15), c2 = B(57, -11), tip = B(64, 0), c3 = B(57, 11), c4 = B(45, 15), p1 = B(40, 7.5);
@@ -1262,23 +1274,25 @@
       });
 
       // 屋根の上の大きな絵筆（右の奥）
-      drawBrush(ctx, R(2.95, 0.9));
+      drawBrush(ctx, R(BRUSH_A, BRUSH_B));
 
       // 看板（共通の形）。屋根のてっぺんに、2本の柱で立てる
       const s = signAt(g);
       buildingSign(ctx, b, s.x, s.y, signPosts(g));
     }
 
-    // 建物の輪郭（屋根の四隅と、壁の足元）
+    // 建物の輪郭（屋根の四隅と、壁の足元。屋根の上の絵筆の頭もふくめる）
     function outline(g) {
-      const k = kit(g), P = k.P, R = k.R;
+      const k = kit(g), P = k.P, R = k.R, base = R(BRUSH_A, BRUSH_B);
       return [
-        R(EA0, EB1), R(EA0, EB0), R(EA1, EB0), R(EA1, EB0, -FASCIA),
+        R(EA0, EB1), R(EA0, EB0),
+        brushPoint(base, 36, -10), brushPoint(base, 50, -16), brushPoint(base, 67, 0), brushPoint(base, 50, 16), brushPoint(base, 34, 10),
+        R(EA1, EB0), R(EA1, EB0, -FASCIA),
         P(A1, B0, 0), P(A1, B1, 0), P(A0, B1, 0), R(EA0, EB1, -FASCIA)
       ];
     }
 
-    return { draw: draw, signAt: signAt, outline: outline };
+    return { draw: draw, signAt: signAt, outline: outline, door: "S" };   // door＝この絵の入口の向き
   })();
 
   // 主人公の体の寸法（px）。数字を変えると体つきが変わる
@@ -2050,7 +2064,7 @@
       if (art) {                                        // テーマ別の絵：その絵の外わくと、看板の四角
         const at = art.signAt(s), z = buildingSignSize(ctx, b);
         body = art.outline(s);
-        onSign = Math.abs(q.x - at.x) < z.w / 2 && Math.abs(q.y - at.y) < z.h / 2;
+        onSign = Math.abs(q.x - at.x) < z.w / 2 + 1 && Math.abs(q.y - at.y) < z.h / 2 + 1;   // ＋1＝ふちの線の分
       } else {                                          // 箱の建物：壁と屋根をまとめた外わくと、てっぺんの看板
         body = [
           s.L, s.F, s.R, { x: s.R.x, y: s.R.y - BUILD.wallH }, s.rR, s.rB, s.rL, { x: s.L.x, y: s.L.y - BUILD.wallH }
