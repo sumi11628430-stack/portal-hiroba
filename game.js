@@ -436,6 +436,47 @@
     return (ctx.measureText(b.sign || b.name).width + 20) / 2;
   }
 
+  // ---- 準備中の建物（config.js の url が空、または書かれていない建物） ----
+  // 着くと「準備中」と知らせるだけで、中には入らない。url を書けば、ほかの建物と同じように入れる。
+  function isPending(b) {
+    return !(b.url && String(b.url).trim());
+  }
+
+  // 建物ごとの、看板（＋準備中の小札）の見せ具合（0＝出さない 〜 1＝そのまま）。書かれていない建物は 1。
+  // 背中ごしのカメラで、手前の建物にほとんど隠れた奥の看板を消すのに使う（斜め見下ろしでは何も書かないので、いつも 1）
+  const signShow = new Map();
+
+  // 看板の下に吊るす「準備中」の小札（移動画面）。(x,y)＝看板の中心、signH＝看板の高さ。
+  // 小札の大きさ・位置は、描くときと押した場所の判定の両方で、この関数で決める
+  const PENDING_TAG = { text: "準備中", font: 11, h: 17, gap: 5 };
+  function pendingTagRect(g, x, y, signH) {
+    g.font = "bold " + PENDING_TAG.font + "px " + FONT;
+    const w = g.measureText(PENDING_TAG.text).width + 14;
+    const top = y + signH / 2 + PENDING_TAG.gap;
+    return { x0: x - w / 2, x1: x + w / 2, y0: y + signH / 2, y1: top + PENDING_TAG.h, top: top, w: w };   // y0〜＝吊りひもを含む
+  }
+  function drawPendingTag(g, b, x, y, signH) {
+    const r = pendingTagRect(g, x, y, signH), col = b.roofColor;
+    // 吊りひも（看板の下のふちから、小札の両肩へ）
+    g.strokeStyle = shade(col, -0.45);
+    g.lineWidth = 1.2;
+    g.beginPath();
+    g.moveTo(x - r.w * 0.3, r.y0); g.lineTo(x - r.w * 0.3, r.top + 2);
+    g.moveTo(x + r.w * 0.3, r.y0); g.lineTo(x + r.w * 0.3, r.top + 2);
+    g.stroke();
+    // 小札（うすい黄色の板＋建物の色のふち）
+    g.fillStyle = "#fff0b8";
+    roundRectPath(g, r.x0, r.top, r.w, PENDING_TAG.h, 5);
+    g.fill();
+    g.strokeStyle = shade(col, -0.25);
+    g.lineWidth = 1.5;
+    g.stroke();
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillStyle = "#5a3d12";
+    g.fillText(PENDING_TAG.text, x, r.top + PENDING_TAG.h / 2 + 0.5);
+  }
+
   // ---- テーマ別の建物の絵（移動画面） ----
 
   // 建物の絵の置き場。config.js の建物に  art: "uranai"  のように書くと、その絵で描く。
@@ -446,7 +487,7 @@
   const BUILDING_ART = Object.create(null);   // 元からの名前（constructor など）を持たない入れ物
 
   // 看板の丸い印。絵の名前 → 印の種類
-  const SIGN_ICONS = Object.assign(Object.create(null), { uranai: "star", gohan: "meal", ea: "chart", gazou: "sparkle" });
+  const SIGN_ICONS = Object.assign(Object.create(null), { uranai: "star", gohan: "meal", ea: "chart", gazou: "sparkle", guild: "shield", tavern: "mug" });
 
   // 星形の道すじ（n＝角の数、R＝外の半径、r＝内の半径）
   function signStarPath(ctx, x, y, R, r, n) {
@@ -469,6 +510,10 @@
   // テーマ別の建物の看板（4つとも同じ形：白い板＋建物の色のふち＋丸い印）。
   //   (x,y)＝看板の中心。posts＝支えの柱の足元の点 [{x,y}, …]（柱は看板の下から足元まで、まっすぐ下ろす。無くてもよい）
   function buildingSign(ctx, b, x, y, posts) {
+    const show = signShow.has(b) ? signShow.get(b) : 1;   // 手前の建物に隠れた看板は、薄くする・出さない（signShow）
+    if (show <= 0.01) return;
+    const alpha0 = ctx.globalAlpha;
+    ctx.globalAlpha = alpha0 * show;
     const col = b.roofColor, text = b.sign || b.name;
     const s = buildingSignSize(ctx, b), w = s.w, h = s.h;
     if (posts && posts.length) {
@@ -507,6 +552,32 @@
         ctx.moveTo(cx - 6, cy + 4.5); ctx.lineTo(cx - 2, cy); ctx.lineTo(cx + 1, cy + 2.5); ctx.lineTo(cx + 5.5, cy - 4);
         ctx.moveTo(cx + 1.5, cy - 4.5); ctx.lineTo(cx + 5.8, cy - 4.5); ctx.lineTo(cx + 5.8, cy - 0.2);
         ctx.stroke();
+      } else if (kind === "shield") {
+        // 盾（白い盾の中に、建物の色の右肩上がりの線）
+        ctx.beginPath();
+        ctx.moveTo(cx - 5.8, cy - 6); ctx.lineTo(cx + 5.8, cy - 6); ctx.lineTo(cx + 5.8, cy - 0.5);
+        ctx.quadraticCurveTo(cx + 5.4, cy + 4.6, cx, cy + 7); ctx.quadraticCurveTo(cx - 5.4, cy + 4.6, cx - 5.8, cy - 0.5);
+        ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = b.roofColor; ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(cx - 3.2, cy + 2.6); ctx.lineTo(cx - 0.8, cy - 0.2); ctx.lineTo(cx + 0.8, cy + 1); ctx.lineTo(cx + 3.4, cy - 2.8);
+        ctx.stroke();
+      } else if (kind === "mug") {
+        // ジョッキ（泡の乗った胴＋右の取っ手）
+        ctx.beginPath();
+        ctx.moveTo(cx - 1.8, cy - 4.4); ctx.arc(cx - 4.1, cy - 4.4, 2.3, 0, Math.PI * 2);
+        ctx.moveTo(cx + 1.6, cy - 5.2); ctx.arc(cx - 1, cy - 5.2, 2.6, 0, Math.PI * 2);
+        ctx.moveTo(cx + 4.4, cy - 4.4); ctx.arc(cx + 2.1, cy - 4.4, 2.3, 0, Math.PI * 2);
+        ctx.fill();
+        roundRectPath(ctx, cx - 6, cy - 4.5, 8.6, 10.5, 1.6); ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(cx + 2.6, cy - 2); ctx.lineTo(cx + 5.6, cy - 2); ctx.lineTo(cx + 5.6, cy + 3.4); ctx.lineTo(cx + 2.6, cy + 3.4);
+        ctx.stroke();
+        ctx.strokeStyle = col; ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(cx - 3.4, cy - 1.2); ctx.lineTo(cx - 3.4, cy + 3.8);
+        ctx.moveTo(cx - 0.6, cy - 1.2); ctx.lineTo(cx - 0.6, cy + 3.8);
+        ctx.stroke();
       }
       ctx.lineCap = "butt"; ctx.lineJoin = "miter";
     }
@@ -515,6 +586,8 @@
     ctx.font = "bold 16px " + FONT;
     ctx.fillStyle = "#33283a";
     ctx.fillText(text, x + s.icon / 2 - 1, y + 1);
+    if (isPending(b)) drawPendingTag(ctx, b, x, y, h);   // 準備中の建物は、看板の下に小札を吊るす
+    ctx.globalAlpha = alpha0;
   }
 
   // ---- 建物ごとの絵（1棟＝1かたまり。3×3マスの土台を前提にした絵） ----
@@ -1295,6 +1368,473 @@
     return { draw: draw, signAt: signAt, outline: outline, door: "S" };   // door＝この絵の入口の向き
   })();
 
+  // EAギルド：旗と紋章を掲げた石造りのギルド館（入口の上の三角の壁に金の盾の紋章・左手前に旗の立つ見張り塔・壁に吊った旗・入口の両わきのたいまつ）
+  BUILDING_ART.guild = (function () {
+    // ---- この建物だけで使う色
+    const GOLD = "#f2c230", GOLD_DARK = "#8a6410", WOOD = "#5b3a22", IRON = "#3b3538", GLOW = "#ffd98a", JOINT = "rgba(70,58,40,0.28)";
+    // ---- 寸法。u＝奥→右の角の向き（入口の壁は u＝U1）、v＝奥→左の角の向き、z＝地面からの高さ(px)
+    const U0 = 0.95, U1 = 2.8, V0 = 0.3, V1 = 2.7, VM = 1.5;        // 母屋の壁と、棟（u の向きに通す＝入口の壁が三角の妻壁になる）
+    const WALL_H = 60, ZE = 56, ZR = 90;                            // 壁の高さ・軒の高さ・棟の高さ
+    const RU1 = 2.95, RV0 = 0.22, RV1 = 2.85;                       // 屋根の広がり（左はしは塔の右の壁 U0 にそろえる）
+    const DOOR_V = 1.5, DOOR_HW = 0.3, DOOR_ZS = 31;                // 入口の扉（高さ＝31＋0.30×36≒42px）
+    const TA0 = 0.15, TA1 = 0.95, TB0 = 1.95, TB1 = 2.85, TZ = 112; // 見張り塔（左手前の角）の範囲と高さ
+    const POLE_U = 0.55, POLE_V = 2.4, POLE_H = 30;                 // 塔の上の旗ざおの位置と高さ
+    const SIGN_U0 = 1.55, SIGN_U1 = 2.85, SIGN_H = 112;             // 看板の柱の位置（棟の上）と、看板の中心の高さ
+    const KZ = 36;                                                  // 1マスぶんの縦の長さ
+
+    // 設計の座標 (u,v,z) → 画面の位置、を返す関数を作る
+    function projector(g) {
+      const ax = (g.R.x - g.Bk.x) / 3, ay = (g.R.y - g.Bk.y) / 3, bx = (g.L.x - g.Bk.x) / 3, by = (g.L.y - g.Bk.y) / 3;
+      return function (u, v, z) { return { x: g.Bk.x + u * ax + v * bx, y: g.Bk.y + u * ay + v * by - (z || 0) }; };
+    }
+    function centerOf(g) { return { x: (g.Bk.x + g.F.x) / 2, y: (g.Bk.y + g.F.y) / 2 }; }
+
+    function draw(ctx, b, g, now) {
+      const P = projector(g), OL = COLORS.outline;
+      const wall = b.wallColor, roof = b.roofColor;
+      const t = now || 0;
+      const SV = 0.10, SU = -0.20, RV = 0.04;                      // 左手前の面／右手前の面／屋根の手前の斜面の明るさ
+
+      // ---- 描く道具
+      function trace(pts, open) { ctx.moveTo(pts[0].x, pts[0].y); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y); if (!open) ctx.closePath(); }
+      function paint(fill, stroke, lw) {
+        if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+        if (stroke !== null) { ctx.strokeStyle = stroke || OL; ctx.lineWidth = lw || 1; ctx.stroke(); }
+      }
+      function poly(pts, fill, stroke, lw) { ctx.beginPath(); trace(pts); paint(fill, stroke, lw); }
+      function lines(segs, color, lw) { ctx.beginPath(); for (let i = 0; i < segs.length; i++) trace(segs[i], true); ctx.strokeStyle = color; ctx.lineWidth = lw || 1; ctx.stroke(); }
+      function rV(u0, u1, v, z0, z1) { return [P(u0, v, z0), P(u1, v, z0), P(u1, v, z1), P(u0, v, z1)]; }   // 左手前を向いた四角
+      function rU(u, v0, v1, z0, z1) { return [P(u, v0, z0), P(u, v1, z0), P(u, v1, z1), P(u, v0, z1)]; }   // 右手前を向いた四角
+      function box(u0, v0, u1, v1, z0, z1, hex) {
+        poly(rV(u0, u1, v1, z0, z1), shade(hex, SV)); poly(rU(u1, v0, v1, z0, z1), shade(hex, SU));
+        poly([P(u0, v0, z1), P(u1, v0, z1), P(u1, v1, z1), P(u0, v1, z1)], shade(hex, 0.3));
+      }
+      function archV(uc, hw, v, z0, zs) { const a = [P(uc - hw, v, z0)]; for (let i = 0; i <= 8; i++) { const q = Math.PI - i / 8 * Math.PI; a.push(P(uc + hw * Math.cos(q), v, zs + hw * KZ * Math.sin(q))); } a.push(P(uc + hw, v, z0)); return a; }
+      function archU(vc, hw, u, z0, zs) { const a = [P(u, vc - hw, z0)]; for (let i = 0; i <= 8; i++) { const q = Math.PI - i / 8 * Math.PI; a.push(P(u, vc + hw * Math.cos(q), zs + hw * KZ * Math.sin(q))); } a.push(P(u, vc + hw, z0)); return a; }
+      // 石積みの目地（左手前の面＝v 一定／右手前の面＝u 一定）。段ごとに縦の目地をずらす
+      function jointsV(u0, u1, v, z1) {
+        const s = [];
+        for (let z = 12, r = 0; z < z1; z += 12, r++) {
+          s.push([P(u0, v, z), P(u1, v, z)]);
+          for (let u = u0 + (r % 2 ? 0.2 : 0.38); u < u1 - 0.05; u += 0.36) s.push([P(u, v, z), P(u, v, Math.min(z + 12, z1))]);
+        }
+        lines(s, JOINT, 1);
+      }
+      function jointsU(u, v0, v1, z1) {
+        const s = [];
+        for (let z = 12, r = 0; z < z1; z += 12, r++) {
+          s.push([P(u, v0, z), P(u, v1, z)]);
+          for (let v = v0 + (r % 2 ? 0.2 : 0.38); v < v1 - 0.05; v += 0.36) s.push([P(u, v, z), P(u, v, Math.min(z + 12, z1))]);
+        }
+        lines(s, JOINT, 1);
+      }
+
+      // ==== 見張り塔（左手前の角。母屋より先に描く＝母屋の壁と屋根が、塔の根元の手前に重なる）
+      poly(rV(TA0, TA1, TB1, 0, TZ), shade(wall, SV));
+      poly(rU(TA1, TB0, TB1, 0, TZ), shade(wall, SU));
+      jointsV(TA0, TA1, TB1, TZ); jointsU(TA1, TB0, TB1, TZ);
+      poly(rV(TA0, TA1, TB1, 0, 7), shade(wall, -0.18)); poly(rU(TA1, TB0, TB1, 0, 7), shade(wall, -0.35));   // 足もとの石の帯
+      // 細長い窓（上が丸い。明かりがゆっくりまたたく）
+      const flick = 0.82 + 0.18 * Math.sin(t * 2.3);
+      ctx.globalAlpha = flick;
+      poly(archV((TA0 + TA1) / 2, 0.09, TB1, 66, 84), GLOW, IRON, 1.5);
+      poly(archV((TA0 + TA1) / 2, 0.09, TB1, 30, 46), GLOW, IRON, 1.5);
+      poly(archU((TB0 + TB1) / 2, 0.09, TA1, 66, 84), shade(GLOW, -0.12), IRON, 1.5);
+      ctx.globalAlpha = 1;
+      // 屋上（床＋凸凹の胸壁。奥の凸から順に描く）
+      poly([P(TA0, TB0, TZ), P(TA1, TB0, TZ), P(TA1, TB1, TZ), P(TA0, TB1, TZ)], shade(wall, -0.30));
+      const M = 0.16, merl = [];
+      [[TA0, TA0 + M], [(TA0 + TA1) / 2 - M / 2, (TA0 + TA1) / 2 + M / 2], [TA1 - M, TA1]].forEach(function (a) {
+        merl.push([a[0], TB0, a[1], TB0 + M]); merl.push([a[0], TB1 - M, a[1], TB1]);
+      });
+      [[TB0 + M + 0.12, TB0 + 2 * M + 0.12], [TB1 - 2 * M - 0.12, TB1 - M - 0.12]].forEach(function (c) {
+        merl.push([TA0, c[0], TA0 + M, c[1]]); merl.push([TA1 - M, c[0], TA1, c[1]]);
+      });
+      merl.sort(function (p, q) { return (p[0] + p[1] + p[2] + p[3]) - (q[0] + q[1] + q[2] + q[3]); });
+      merl.forEach(function (m) { box(m[0], m[1], m[2], m[3], TZ, TZ + 8, wall); });
+
+      // ---- 塔の上の旗（左へなびく。ギルドの色の地に金のコイン）
+      const pb = P(POLE_U, POLE_V, TZ), pt = P(POLE_U, POLE_V, TZ + POLE_H);
+      lines([[pb, pt]], IRON, 2.2);
+      const FL = 30, FH = 17, N = 8, top = [], bot = [];
+      for (let i = 0; i <= N; i++) {
+        const k = i / N, dy = Math.sin(t * 3.2 - i * 0.85) * 2.4 * k;
+        top.push({ x: pt.x - 1 - FL * k, y: pt.y + 3 + dy });
+        bot.push({ x: pt.x - 1 - FL * k, y: pt.y + 3 + FH + dy });
+      }
+      const tail = { x: bot[N].x + 6, y: (top[N].y + bot[N].y) / 2 };   // 燕尾（先の切れこみ）
+      poly(top.concat([tail]).concat(bot.slice().reverse()), roof, shade(roof, -0.45), 1);
+      lines([top.slice(0, 3), bot.slice(0, 3)], GOLD, 1.5);                // 根元の金のふち
+      const cm = { x: (top[3].x + bot[3].x) / 2, y: (top[3].y + bot[3].y) / 2 };
+      ctx.beginPath(); ctx.arc(cm.x, cm.y, 4.6, 0, Math.PI * 2); paint(GOLD, GOLD_DARK, 1);
+      lines([[{ x: cm.x - 2.2, y: cm.y + 1.6 }, { x: cm.x, y: cm.y - 0.6 }, { x: cm.x + 2.4, y: cm.y - 2.6 }]], GOLD_DARK, 1.2);
+      ctx.beginPath(); ctx.arc(pt.x, pt.y - 1.5, 2.6, 0, Math.PI * 2); paint(GOLD, GOLD_DARK, 1);   // さおの先の金の玉
+
+      // ==== 母屋の壁（左手前＝明るい、右手前の三角の妻壁＝暗い）と、石の土台
+      poly(rV(U0, U1, V1, 0, WALL_H), shade(wall, SV));
+      poly([P(U1, V0, 0), P(U1, V1, 0), P(U1, V1, WALL_H), P(U1, VM, ZR), P(U1, V0, WALL_H)], shade(wall, SU));
+      jointsV(U0, U1, V1, WALL_H); jointsU(U1, V0, V1, WALL_H);
+      poly(rV(U0, U1, V1, 0, 7), shade(wall, -0.18)); poly(rU(U1, V0, V1, 0, 7), shade(wall, -0.35));
+
+      // ---- 左手前の壁：上が丸い窓2つ（明かりがまたたく）と、まん中に吊った旗
+      ctx.globalAlpha = flick;
+      [1.38, 2.4].forEach(function (u) {
+        poly(archV(u, 0.16, V1, 14, 30), GLOW, shade(wall, -0.45), 2);
+        lines([[P(u, V1, 14), P(u, V1, 30 + 0.16 * KZ)], [P(u - 0.16, V1, 26), P(u + 0.16, V1, 26)]], shade(wall, -0.45), 1.3);
+      });
+      ctx.globalAlpha = 1;
+      const BU = 1.89, BW = 0.19;
+      poly([P(BU - BW, V1, 52), P(BU + BW, V1, 52), P(BU + BW, V1, 20), P(BU, V1, 26), P(BU - BW, V1, 20)], roof, shade(roof, -0.45), 1);
+      lines([[P(BU - BW - 0.05, V1, 52.5), P(BU + BW + 0.05, V1, 52.5)]], GOLD_DARK, 2.5);   // 旗をさげる棒
+      lines([[P(BU - BW + 0.05, V1, 49), P(BU - BW + 0.05, V1, 23)], [P(BU + BW - 0.05, V1, 49), P(BU + BW - 0.05, V1, 23)]], GOLD, 1);
+      const bc = P(BU, V1, 39);
+      ctx.beginPath(); ctx.arc(bc.x, bc.y, 4, 0, Math.PI * 2); paint(GOLD, GOLD_DARK, 1);
+
+      // ---- 入口（右手前の妻壁の中央。石のふちのアーチ＋鉄の帯の木の扉＋取っ手）と、石の段
+      poly(archU(DOOR_V, DOOR_HW + 0.08, U1, 0, DOOR_ZS), shade(wall, 0.25));
+      poly(archU(DOOR_V, DOOR_HW, U1, 0, DOOR_ZS), WOOD);
+      lines([[P(U1, DOOR_V, 0), P(U1, DOOR_V, DOOR_ZS + DOOR_HW * KZ)]], "rgba(0,0,0,0.45)", 1);
+      lines([[P(U1, DOOR_V - DOOR_HW, 10), P(U1, DOOR_V + DOOR_HW, 10)], [P(U1, DOOR_V - DOOR_HW, 27), P(U1, DOOR_V + DOOR_HW, 27)]], IRON, 2.5);
+      const k1 = P(U1, DOOR_V - 0.08, 18), k2 = P(U1, DOOR_V + 0.08, 18);
+      ctx.beginPath(); ctx.arc(k1.x, k1.y, 2.2, 0, Math.PI * 2); ctx.moveTo(k2.x + 2.2, k2.y); ctx.arc(k2.x, k2.y, 2.2, 0, Math.PI * 2);
+      paint(null, GOLD, 1.5);
+      box(U1, DOOR_V - 0.45, 3.06, DOOR_V + 0.45, 0, 5, wall);
+
+      // ---- 入口の両わきのたいまつ（炎がゆれる）
+      [0.88, 2.12].forEach(function (v, i) {
+        const base = P(U1, v, 30), f = 1 + 0.12 * Math.sin(t * 7 + i * 2.1);
+        lines([[base, { x: base.x + 4, y: base.y - 3 }]], IRON, 2.5);
+        const fx = base.x + 4, fy = base.y - 4;
+        ctx.beginPath(); ctx.moveTo(fx, fy - 9 * f); ctx.quadraticCurveTo(fx + 4.5, fy - 2, fx, fy + 1); ctx.quadraticCurveTo(fx - 4.5, fy - 2, fx, fy - 9 * f);
+        paint("#ff9a3c", null);
+        ctx.beginPath(); ctx.moveTo(fx, fy - 5.5 * f); ctx.quadraticCurveTo(fx + 2.2, fy - 1.5, fx, fy); ctx.quadraticCurveTo(fx - 2.2, fy - 1.5, fx, fy - 5.5 * f);
+        paint("#ffe48a", null);
+      });
+
+      // ---- 入口の上の紋章（金のふちの盾。中に金の右肩上がりの線）
+      function shieldPath(vc, hw, zt, zs, zb) {
+        const a = P(U1, vc + hw, zt), b2 = P(U1, vc - hw, zt), c = P(U1, vc - hw, zs), d = P(U1, vc, zb), e = P(U1, vc + hw, zs);
+        const c1 = P(U1, vc - hw, zb + 4), c2 = P(U1, vc + hw, zb + 4);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b2.x, b2.y); ctx.lineTo(c.x, c.y);
+        ctx.quadraticCurveTo(c1.x, c1.y, d.x, d.y); ctx.quadraticCurveTo(c2.x, c2.y, e.x, e.y); ctx.closePath();
+      }
+      shieldPath(DOOR_V, 0.23, 72, 61, 46); paint(GOLD, GOLD_DARK, 1);
+      shieldPath(DOOR_V, 0.175, 69.5, 61, 50); paint(roof, null);
+      ctx.lineJoin = "round"; ctx.lineCap = "round";
+      lines([[P(U1, DOOR_V + 0.11, 55), P(U1, DOOR_V + 0.03, 61), P(U1, DOOR_V - 0.03, 58), P(U1, DOOR_V - 0.11, 66)]], GOLD, 2);
+      lines([[P(U1, DOOR_V - 0.04, 66.5), P(U1, DOOR_V - 0.11, 66), P(U1, DOOR_V - 0.11, 62)]], GOLD, 2);
+      ctx.lineJoin = "miter"; ctx.lineCap = "butt";
+
+      // ==== 屋根（ギルドの色のスレートの切妻。軒の裏→手前の斜面→スレートの目地→ふちの太い線→金の棟）
+      function S(s, k) { return P(U0 + (RU1 - U0) * s, RV1 - (RV1 - VM) * k, ZE + (ZR - ZE) * k); }      // 屋根の手前の斜面の上の点
+      poly([P(U1, VM, ZR), P(RU1, VM, ZR), P(RU1, RV0, ZE), P(U1, RV0, ZE)], shade(roof, -0.5));
+      poly([S(0, 0), S(1, 0), S(1, 1), S(0, 1)], shade(roof, RV));
+      const sl = [];
+      [0.25, 0.5, 0.75].forEach(function (k, r) {
+        sl.push([S(0, k), S(1, k)]);
+        for (let s = r % 2 ? 0.07 : 0.14; s < 1; s += 0.14) sl.push([S(s, k), S(s, Math.min(k + 0.25, 1))]);
+      });
+      for (let s = 0.07; s < 1; s += 0.14) sl.push([S(s, 0), S(s, 0.25)]);
+      lines(sl, shade(roof, -0.28), 1);
+      ctx.lineJoin = "round";
+      lines([[P(RU1, RV1, ZE), P(RU1, VM, ZR), P(RU1, RV0, ZE)]], shade(roof, -0.42), 4);
+      lines([[S(0, 0), S(1, 0)]], shade(roof, -0.42), 3);
+      lines([[S(0, 0), S(0, 1)]], shade(roof, -0.42), 2);
+      lines([[S(0, 1), S(1, 1)]], GOLD_DARK, 4.5);
+      lines([[S(0, 1), S(1, 1)]], GOLD, 2.5);
+      ctx.lineJoin = "miter";
+
+      // ---- 看板（共通の看板。棟の上に立てた2本の柱で支える）
+      const s = signAt(g);
+      buildingSign(ctx, b, s.x, s.y, [P(SIGN_U0, VM, ZR), P(SIGN_U1, VM, ZR)]);
+    }
+
+    // 看板の中心（2本の柱のまん中の真上）
+    function signAt(g) {
+      const P = projector(g), C = centerOf(g);
+      return { x: P((SIGN_U0 + SIGN_U1) / 2, VM, 0).x, y: C.y - SIGN_H };
+    }
+
+    // 建物の輪郭（塔・塔の旗・看板の柱・屋根・妻壁・石の段をおおう）
+    function outline(g) {
+      const P = projector(g), pt = P(POLE_U, POLE_V, TZ + POLE_H), s = signAt(g);
+      return [
+        P(TA0, TB1, 0),                                     // 塔の左手前の足もと
+        P(TA0, TB1, TZ + 8),                                // 塔の左手前の上（胸壁）
+        { x: pt.x - 36, y: pt.y + 25 },                     // 旗の先の下
+        { x: pt.x - 36, y: pt.y - 1 },                      // 旗の先の上
+        { x: pt.x + 4, y: pt.y - 6 },                       // さおの先の金の玉
+        P(TA1, TB0, TZ + 8),                                // 塔の右奥の上（胸壁）
+        { x: P(SIGN_U0, VM, ZR).x, y: s.y },                // 看板の左の柱の上
+        { x: P(SIGN_U1, VM, ZR).x, y: s.y },                // 看板の右の柱の上
+        P(RU1, VM, ZR),                                     // 屋根の右はしのてっぺん
+        P(RU1, RV0, ZE),                                    // 屋根の右奥の軒
+        P(U1, V0, 0),                                       // 母屋の右奥の足もと
+        P(3.06, DOOR_V - 0.45, 0),                          // 石の段の右
+        P(3.06, DOOR_V + 0.45, 0),                          // 石の段の手前
+        P(U1, V1, 0),                                       // 母屋の手前の角
+        P(TA1, TB1, 0)                                      // 塔の右手前の足もと
+      ];
+    }
+
+    return { draw: draw, signAt: signAt, outline: outline, door: "E" };   // door＝この絵の入口の向き
+  })();
+
+  // 酒場：木組みのしっくい壁に、こげ茶の切妻屋根をのせた町の酒場（入口の真上に棟が来る妻入り。ジョッキの吊り看板・入口わきの樽・明かりのもれる窓・けむりの出る煙突）
+  BUILDING_ART.tavern = (function () {
+    // ---- この建物だけで使う色 ----
+    const BEAM = "#5b3a22", PLANK = "#9a6236", STONE = "#a99f90", BRICK = "#a65d43";
+    const GLOW = "#ffcf5c", GLOW_HI = "#fff0b0", FLOWER = "#f2685a", LEAF = "#4f9a3c";
+    const BARREL = "#b0723a", HOOP = "#4b4744", BEER = "#f3b02c", FOAM = "#fffaf0", IRON = "#3a302c", GOLD = "#f2c230";
+
+    // ---- 寸法（a＝奥→右の向き、b＝奥→左の向き。どちらも 0〜3 マス。高さは px） ----
+    const A0 = 0.25, A1 = 2.8, B0 = 0.3, B1 = 2.7;              // 壁の範囲（入口の壁は a＝A1。右手前の面）
+    const VM = 1.5;                                             // 棟（屋根のてっぺんの線）の位置。入口の真上
+    const ZE = 50, ZR = 84;                                     // 壁の高さ（軒の高さ）・棟の高さ
+    const RA0 = 0.1, RA1 = 2.95, RB0 = 0.1, RB1 = 2.9;          // 屋根の広がり（土台の外へは出さない）
+    const FASCIA = 4;                                           // 屋根の厚み
+    const DOOR_HW = 0.26, DOOR_ZS = 30, KZ = 36;                // 入口の扉（半分の幅・アーチの始まる高さ）・1マスぶんの縦の長さ
+    const SIGN_A0 = 2.2, SIGN_A1 = 2.85, SIGN_H = 144;         // 看板の柱の位置（棟の上）・看板の中心の高さ（土台の手前の角から）
+    const CH_A = 1.15, CH_B = 2.05, CH_HW = 0.11, CH_TOP = 110; // 煙突の場所（屋根の手前の斜面）・太さの半分・てっぺんの高さ
+    const MUG_B = 2.28, MUG_Z = 47;                             // ジョッキの吊り看板：下がる位置（入口の壁の上、扉の左）・腕木の高さ
+    const BARRELS = [[2.5, 2.95], [2.98, 2.5]];                 // 樽の場所（入口の左、手前の角のまわり。入口のマスには置かない）
+    const BR = 0.19, BH = 20, KR = 45.25;                       // 樽の半径・高さ・円の横幅の係数
+
+    // 土台の上の位置を決める。a＝Bk→R 方向（0〜3マス）、b＝Bk→L 方向（0〜3マス）、h＝高さ
+    function pointer(g) {
+      const ax = (g.R.x - g.Bk.x) / 3, ay = (g.R.y - g.Bk.y) / 3, bx = (g.L.x - g.Bk.x) / 3, by = (g.L.y - g.Bk.y) / 3;
+      return function (a, b, h) { return { x: g.Bk.x + a * ax + b * bx, y: g.Bk.y + a * ay + b * by - (h || 0) }; };
+    }
+    // 屋根の面の高さ（棟で ZR、壁の上で ZE。その先の軒はさらに下がる）
+    function roofZ(bb) { return ZR - (ZR - ZE) * Math.abs(bb - VM) / (B1 - VM); }
+
+    // 看板の中心（棟の上の2本の柱のまん中の真上）
+    function signAt(g) {
+      const m = pointer(g)((SIGN_A0 + SIGN_A1) / 2, VM, 0);
+      return { x: m.x, y: g.F.y - SIGN_H };
+    }
+
+    // 建物の輪郭（屋根・煙突・壁・入口の段・樽をおおう。吊り看板は入口の壁の範囲の中に入っている）
+    function outline(g) {
+      const P = pointer(g), zE = roofZ(RB1), zB = roofZ(RB0), top = P(CH_A, CH_B, CH_TOP + 4);
+      const rx = BR * KR, b1 = P(BARRELS[0][0], BARRELS[0][1], 0), b2 = P(BARRELS[1][0], BARRELS[1][1], 0);
+      return [
+        P(A0, B1, 0),                                     // 左手前の壁の足もと（奥）
+        P(RA0, RB1, zE - FASCIA),                         // 軒の左はし
+        P(RA0, VM, ZR + 3),                               // 棟のいちばん奥
+        { x: top.x - 9, y: top.y }, { x: top.x + 9, y: top.y },   // 煙突のてっぺん
+        P(RA1, VM, ZR + 3),                               // 棟の手前のはし
+        P(RA1, RB0, zB), P(RA1, RB0, zB - FASCIA),        // 奥の軒の右はし
+        P(A1, B0, 0),                                     // 入口の壁の足もと（奥）
+        P(A1 + 0.12, VM - 0.34, 0), P(A1 + 0.12, VM + 0.34, 0),   // 入口の段
+        { x: b2.x + rx, y: b2.y }, { x: b2.x, y: b2.y + rx / 2 + 1 },   // 入口わきの樽
+        { x: b1.x, y: b1.y + rx / 2 + 1 }, { x: b1.x - rx, y: b1.y }    // 角の樽
+      ];
+    }
+
+    function draw(ctx, b, g, now) {
+      const P = pointer(g), OL = COLORS.outline, wall = b.wallColor, roof = b.roofColor, t = now || 0;
+      const zE = roofZ(RB1), zB = roofZ(RB0);
+      // 左手前を向いた面（b が一定）の四角
+      function qS(bb, a0, a1, h0, h1, col, st) {
+        fillPoly(ctx, [P(a0, bb, h0), P(a1, bb, h0), P(a1, bb, h1), P(a0, bb, h1)], col, st === undefined ? OL : st);
+      }
+      // 右手前を向いた面（a が一定）の四角
+      function qE(aa, b0, b1, h0, h1, col, st) {
+        fillPoly(ctx, [P(aa, b0, h0), P(aa, b1, h0), P(aa, b1, h1), P(aa, b0, h1)], col, st === undefined ? OL : st);
+      }
+      // 線をまとめて引く
+      function lines(segs, col, lw) {
+        ctx.beginPath();
+        segs.forEach(function (s) { ctx.moveTo(s[0].x, s[0].y); for (let i = 1; i < s.length; i++) ctx.lineTo(s[i].x, s[i].y); });
+        ctx.strokeStyle = col; ctx.lineWidth = lw || 1; ctx.stroke();
+      }
+      // 入口の壁（a が一定）の上のアーチ形
+      function archE(aa, bc, hw, z0, zs) {
+        const pts = [P(aa, bc - hw, z0)];
+        for (let i = 0; i <= 8; i++) { const q = Math.PI - i / 8 * Math.PI; pts.push(P(aa, bc + hw * Math.cos(q), zs + hw * KZ * Math.sin(q))); }
+        pts.push(P(aa, bc + hw, z0));
+        return pts;
+      }
+      // 丸い物の2色塗り（左が明るい・右が暗い）
+      function tone(x0, x1, hex) {
+        const gr = ctx.createLinearGradient(x0, 0, x1, 0), a = shade(hex, 0.12), d = shade(hex, -0.22);
+        gr.addColorStop(0, a); gr.addColorStop(0.56, a); gr.addColorStop(0.56, d); gr.addColorStop(1, d); return gr;
+      }
+      // 明かりのもれる窓。face＝"S"（左手前の壁）か "E"（入口の壁）、c0〜c1＝壁にそった範囲、i＝ゆらぎをずらす番号
+      function glowWindow(face, c0, c1, z0, z1, i) {
+        const q = face === "S" ? function (c, z) { return P(c, B1, z); } : function (c, z) { return P(A1, c, z); };
+        const cm = (c0 + c1) / 2, zm = (z0 + z1) / 2, w = (c1 - c0) * 0.3;
+        fillPoly(ctx, [q(c0, z0), q(c1, z0), q(c1, z1), q(c0, z1)], GLOW);
+        ctx.globalAlpha = clamp(0.55 + 0.25 * Math.sin(t * 2.3 + i * 1.9) + 0.12 * Math.sin(t * 5.3 + i), 0, 1);   // 中の明かりがゆらぐ
+        fillPoly(ctx, [q(cm - w, z0), q(cm + w, z0), q(cm + w, zm + 3), q(cm - w, zm + 3)], GLOW_HI);
+        ctx.globalAlpha = 1;
+        ctx.beginPath(); const p0 = q(c0, z0), p1 = q(c1, z0), p2 = q(c1, z1), p3 = q(c0, z1);
+        ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.lineTo(p3.x, p3.y); ctx.closePath();
+        ctx.strokeStyle = BEAM; ctx.lineWidth = 2.4; ctx.stroke();
+        lines([[q(cm, z0), q(cm, z1)], [q(c0, zm), q(c1, zm)]], BEAM, 1.6);
+      }
+      // 樽（たての円柱。胴が少しふくらむ）
+      function barrel(a, bb) {
+        const c = P(a, bb, 0), rx = BR * KR, re = rx * 0.88, yb = c.y, yt = c.y - BH, ym = c.y - BH / 2;
+        ctx.beginPath();
+        ctx.moveTo(c.x - re, yt);
+        ctx.quadraticCurveTo(c.x - rx * 1.12, ym, c.x - re, yb);
+        ctx.ellipse(c.x, yb, re, re / 2, 0, Math.PI, 0, true);
+        ctx.quadraticCurveTo(c.x + rx * 1.12, ym, c.x + re, yt);
+        ctx.closePath();
+        ctx.fillStyle = tone(c.x - rx, c.x + rx, BARREL); ctx.fill();
+        ctx.strokeStyle = OL; ctx.lineWidth = 1; ctx.stroke();
+        // たがの鉄の輪（手前の半分）
+        [yb - 4, yt + 4].forEach(function (y) {
+          ctx.beginPath(); ctx.ellipse(c.x, y, rx * 0.97, rx * 0.97 / 2, 0, 0.1, Math.PI - 0.1);
+          ctx.strokeStyle = HOOP; ctx.lineWidth = 2; ctx.stroke();
+        });
+        // ふた
+        ctx.beginPath(); ctx.ellipse(c.x, yt, re, re / 2, 0, 0, Math.PI * 2);
+        ctx.fillStyle = shade(BARREL, 0.28); ctx.fill(); ctx.strokeStyle = OL; ctx.lineWidth = 1; ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(c.x, yt, re * 0.62, re * 0.31, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(110,60,20,0.45)"; ctx.stroke();
+      }
+
+      // ---- 入口の前の地面にもれる明かり ----
+      const lp = P(A1 + 0.35, VM, 0);
+      ctx.save();
+      ctx.translate(lp.x, lp.y); ctx.scale(1, 0.5);
+      const lg = ctx.createRadialGradient(0, 0, 0, 0, 0, 22);
+      lg.addColorStop(0, "rgba(255,206,110,0.45)"); lg.addColorStop(1, "rgba(255,206,110,0)");
+      ctx.fillStyle = lg; ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+
+      // ---- 屋根の奥の斜面（棟の右に細く見える所。手前の壁と屋根で大部分が隠れる）----
+      fillPoly(ctx, [P(RA0, VM, ZR), P(RA1, VM, ZR), P(RA1, RB0, zB), P(RA0, RB0, zB)], shade(roof, -0.28), OL);
+
+      // ---- 壁（しっくい。左手前＝明るい、右手前の妻壁＝暗い）と、石の土台 ----
+      qS(B1, A0, A1, 0, ZE, shade(wall, 0.10));
+      fillPoly(ctx, [P(A1, B0, 0), P(A1, B1, 0), P(A1, B1, ZE), P(A1, VM, ZR), P(A1, B0, ZE)], shade(wall, -0.18), OL);
+      qS(B1, A0, A1, 0, 7, shade(STONE, 0.10));
+      qE(A1, B0, B1, 0, 7, shade(STONE, -0.18));
+
+      // ---- 木組み（柱・はり・すじかい）----
+      const fr = [];
+      [A0 + 0.04, 1.28, 2.32, A1 - 0.03].forEach(function (a) { fr.push([P(a, B1, 7), P(a, B1, ZE)]); });   // 左手前の壁の柱
+      fr.push([P(A0, B1, 8), P(A1, B1, 8)], [P(A0, B1, ZE - 2), P(A1, B1, ZE - 2)]);                       // 土台の上のはり・軒のはり
+      fr.push([P(2.36, B1, 10), P(2.76, B1, ZE - 4)], [P(2.76, B1, 10), P(2.36, B1, ZE - 4)]);               // すじかい（ばつ印）
+      fr.push([P(A1, B0 + 0.04, 7), P(A1, B0 + 0.04, ZE)]);                                                  // 入口の壁の奥の柱
+      fr.push([P(A1, B0, 8), P(A1, B1, 8)], [P(A1, B0, ZE), P(A1, B1, ZE)]);                                 // 入口の壁のはり
+      fr.push([P(A1, VM - 0.45, ZE), P(A1, VM - 0.45, roofZ(VM - 0.45) - 2)], [P(A1, VM + 0.45, ZE), P(A1, VM + 0.45, roofZ(VM + 0.45) - 2)]);   // 妻壁の束
+      lines(fr, BEAM, 3);
+
+      // ---- 窓（明かりがゆらぐ）と、左手前の窓の下の花箱 ----
+      glowWindow("S", 0.52, 1.02, 14, 33, 0);
+      glowWindow("S", 1.55, 2.05, 14, 33, 1);
+      glowWindow("E", 0.55, 1.0, 14, 33, 2);
+      [[0.49, 1.05], [1.52, 2.08]].forEach(function (w, i) {
+        qS(B1 + 0.1, w[0], w[1], 8, 13, PLANK);
+        qE(w[1], B1, B1 + 0.1, 8, 13, shade(PLANK, -0.25));
+        for (let k = 0; k < 4; k++) {
+          const f = P(lerp(w[0] + 0.06, w[1] - 0.06, k / 3), B1 + 0.06, 15.5);
+          ctx.beginPath(); ctx.arc(f.x, f.y + 1.5, 2.6, 0, Math.PI * 2); ctx.fillStyle = LEAF; ctx.fill();
+          ctx.beginPath(); ctx.arc(f.x, f.y - 0.5, 1.9, 0, Math.PI * 2); ctx.fillStyle = (k + i) % 2 ? "#ffd23f" : FLOWER; ctx.fill();
+        }
+      });
+      // 妻壁の丸窓
+      const rw = []; for (let i = 0; i < 14; i++) { const q = i / 14 * Math.PI * 2; rw.push(P(A1, VM + 6 / KZ * Math.cos(q), 65 + 6 * Math.sin(q))); }
+      fillPoly(ctx, rw, GLOW);
+      ctx.strokeStyle = BEAM; ctx.lineWidth = 2.4; ctx.stroke();
+
+      // ---- 入口（木の枠＋板の扉＋小窓＋取っ手）と、石の段 ----
+      fillPoly(ctx, archE(A1, VM, DOOR_HW + 0.06, 0, DOOR_ZS), BEAM);
+      fillPoly(ctx, archE(A1, VM, DOOR_HW, 0, DOOR_ZS), PLANK);
+      const pl = [];
+      [-0.13, 0, 0.13].forEach(function (d) { pl.push([P(A1, VM + d, 1), P(A1, VM + d, DOOR_ZS + Math.sqrt(DOOR_HW * DOOR_HW - d * d) * KZ - 1)]); });
+      lines(pl, "rgba(70,40,20,0.45)", 1);
+      lines([[P(A1, VM - DOOR_HW, 10), P(A1, VM + DOOR_HW, 10)], [P(A1, VM - DOOR_HW, 25), P(A1, VM + DOOR_HW, 25)]], IRON, 2);   // 鉄の帯
+      const dw = P(A1, VM, 33);
+      ctx.beginPath(); ctx.ellipse(dw.x, dw.y, 3.6, 4.2, 0, 0, Math.PI * 2); ctx.fillStyle = GLOW_HI; ctx.fill();
+      ctx.strokeStyle = BEAM; ctx.lineWidth = 1.6; ctx.stroke();
+      const kb = P(A1, VM + 0.17, 17);
+      ctx.beginPath(); ctx.arc(kb.x, kb.y, 1.8, 0, Math.PI * 2); ctx.fillStyle = GOLD; ctx.fill();
+      qS(VM + 0.34, A1, A1 + 0.12, 0, 3, shade(STONE, 0.15));
+      qE(A1 + 0.12, VM - 0.34, VM + 0.34, 0, 3, shade(STONE, -0.1));
+      fillPoly(ctx, [P(A1, VM - 0.34, 3), P(A1 + 0.12, VM - 0.34, 3), P(A1 + 0.12, VM + 0.34, 3), P(A1, VM + 0.34, 3)], shade(STONE, 0.35), OL);
+
+      // ---- 屋根の手前の斜面（こげ茶の板ぶき）と、厚み・ふち・棟 ----
+      function S(s, k) { return P(RA0 + (RA1 - RA0) * s, VM + (RB1 - VM) * k, ZR + (zE - ZR) * k); }   // s＝奥(0)→手前(1)、k＝棟(0)→軒(1)
+      fillPoly(ctx, [S(0, 0), S(1, 0), S(1, 1), S(0, 1)], shade(roof, 0.10), OL);
+      const rows = [0, 0.2, 0.4, 0.6, 0.8, 1], sh = [];
+      for (let r = 1; r < rows.length - 1; r++) sh.push([S(0, rows[r]), S(1, rows[r])]);
+      lines(sh, shade(roof, -0.28), 1);
+      const tk = [];
+      for (let r = 0; r < rows.length - 1; r++) {
+        for (let s = (r % 2 ? 0.05 : 0.1); s < 0.99; s += 0.1) tk.push([S(s, rows[r]), S(s, rows[r + 1])]);
+      }
+      lines(tk, "rgba(40,20,10,0.22)", 1);
+      fillPoly(ctx, [S(0, 1), S(1, 1), P(RA1, RB1, zE - FASCIA), P(RA0, RB1, zE - FASCIA)], shade(roof, -0.15), OL);       // 軒の厚み
+      fillPoly(ctx, [P(RA1, VM, ZR), P(RA1, RB0, zB), P(RA1, RB0, zB - FASCIA), P(RA1, VM, ZR - FASCIA)], shade(roof, -0.48), OL);   // 奥の斜面のふち
+      fillPoly(ctx, [P(RA1, VM, ZR), P(RA1, RB1, zE), P(RA1, RB1, zE - FASCIA), P(RA1, VM, ZR - FASCIA)], shade(roof, -0.36), OL);   // 手前の斜面のふち
+      ctx.lineCap = "round";
+      lines([[P(RA0, VM, ZR + 1), P(RA1, VM, ZR + 1)]], shade(roof, -0.45), 4);   // 棟
+      ctx.lineCap = "butt";
+
+      // ---- れんがの煙突（屋根の手前の斜面から立つ）と、けむり ----
+      const c0 = CH_A - CH_HW, c1 = CH_A + CH_HW, d0 = CH_B - CH_HW, d1 = CH_B + CH_HW;
+      fillPoly(ctx, [P(c0, d1, roofZ(d1)), P(c1, d1, roofZ(d1)), P(c1, d1, CH_TOP), P(c0, d1, CH_TOP)], shade(BRICK, 0.08), OL);
+      fillPoly(ctx, [P(c1, d0, roofZ(d0)), P(c1, d1, roofZ(d1)), P(c1, d1, CH_TOP), P(c1, d0, CH_TOP)], shade(BRICK, -0.22), OL);
+      lines([[P(c0, d1, CH_TOP - 12), P(c1, d1, CH_TOP - 12), P(c1, d0, CH_TOP - 12)], [P(c0, d1, CH_TOP - 24), P(c1, d1, CH_TOP - 24), P(c1, d0, CH_TOP - 24)]], "rgba(70,30,20,0.35)", 1);
+      const e = 0.03;                                                    // てっぺんのふち（少し太い）
+      qS(d1 + e, c0 - e, c1 + e, CH_TOP - 4, CH_TOP, shade(BRICK, -0.05));
+      qE(c1 + e, d0 - e, d1 + e, CH_TOP - 4, CH_TOP, shade(BRICK, -0.32));
+      fillPoly(ctx, [P(c0 - e, d0 - e, CH_TOP), P(c1 + e, d0 - e, CH_TOP), P(c1 + e, d1 + e, CH_TOP), P(c0 - e, d1 + e, CH_TOP)], shade(BRICK, 0.25), OL);
+      fillPoly(ctx, [P(c0 + 0.03, d0 + 0.03, CH_TOP), P(c1 - 0.03, d0 + 0.03, CH_TOP), P(c1 - 0.03, d1 - 0.03, CH_TOP), P(c0 + 0.03, d1 - 0.03, CH_TOP)], "#3a2a24");
+      const sm = P(CH_A, CH_B, CH_TOP + 2);
+      for (let i = 0; i < 3; i++) {                                      // けむり（ゆっくり上って薄くなる）
+        const k = (t * 0.35 + i / 3) % 1;
+        ctx.globalAlpha = 0.55 * (1 - k);
+        ctx.beginPath(); ctx.arc(sm.x - 7 * k + Math.sin(t * 1.3 + i) * 1.5, sm.y - 4 - 16 * k, 3 + 3.5 * k, 0, Math.PI * 2);
+        ctx.fillStyle = "#f2efe9"; ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      // ---- 入口わきの樽（角の樽を先に）----
+      barrel(BARRELS[0][0], BARRELS[0][1]);
+      barrel(BARRELS[1][0], BARRELS[1][1]);
+
+      // ---- ジョッキの吊り看板（入口の壁から鉄の腕木で下げる。風で少しゆれる）----
+      const sw = Math.sin(t * 1.6) * 0.03;
+      function M(u, z) { return P(u + sw * (MUG_Z - z) / 26, MUG_B, z); }  // 下ほどゆれが大きい
+      lines([[P(A1, MUG_B, MUG_Z), P(3.36, MUG_B, MUG_Z)], [P(A1, MUG_B, MUG_Z - 10), P(3.02, MUG_B, MUG_Z)]], IRON, 2);
+      lines([[P(2.96, MUG_B, MUG_Z), M(2.96, 41.5)], [P(3.24, MUG_B, MUG_Z), M(3.24, 41.5)]], IRON, 1);
+      ctx.lineJoin = "round";
+      // 取っ手（太い線をふち→中の順に）
+      [["#6a4316", 4.4], [shade(BEER, 0.25), 2.2]].forEach(function (st) {
+        ctx.beginPath(); const h0 = M(3.27, 35), h1 = M(3.39, 34), h2 = M(3.39, 24), h3 = M(3.27, 23);
+        ctx.moveTo(h0.x, h0.y); ctx.lineTo(h1.x, h1.y); ctx.lineTo(h2.x, h2.y); ctx.lineTo(h3.x, h3.y);
+        ctx.strokeStyle = st[0]; ctx.lineWidth = st[1]; ctx.stroke();
+      });
+      // 胴（金色のビール）
+      fillPoly(ctx, [M(2.88, 39), M(3.28, 39), M(3.26, 19), M(2.9, 19)], BEER);
+      ctx.strokeStyle = "#6a4316"; ctx.lineWidth = 1.4; ctx.stroke();
+      lines([[M(2.99, 36), M(2.99, 22)], [M(3.17, 36), M(3.17, 22)]], "rgba(255,255,255,0.55)", 1.4);   // ガラスの照り
+      // 泡（ふわっと丸く盛り上がる）
+      ctx.beginPath();
+      [[2.92, 40.5, 3.4], [3.03, 43, 4], [3.15, 42, 3.8], [3.25, 40, 3]].forEach(function (f) {
+        const p = M(f[0], f[1]); ctx.moveTo(p.x + f[2], p.y); ctx.arc(p.x, p.y, f[2], 0, Math.PI * 2);
+      });
+      ctx.fillStyle = FOAM; ctx.fill();
+      ctx.strokeStyle = "rgba(106,67,22,0.6)"; ctx.lineWidth = 1; ctx.stroke();
+      const fb = [M(2.88, 39), M(3.28, 39), M(3.28, 41), M(2.88, 41)];
+      fillPoly(ctx, fb, FOAM);
+      ctx.lineJoin = "miter";
+
+      // ---- 看板（共通の看板。棟の上に立てた2本の柱で支える）----
+      const s = signAt(g);
+      buildingSign(ctx, b, s.x, s.y, [P(SIGN_A0, VM, ZR), P(SIGN_A1, VM, ZR)]);
+    }
+
+    return { draw: draw, signAt: signAt, outline: outline, door: "E" };   // door＝この絵の入口の向き
+  })();
+
   // 主人公の体の寸法（px）。数字を変えると体つきが変わる
   const BODY = {
     leg: 11.5,       // もも・すねの長さ
@@ -1482,6 +2022,20 @@
       ctx.fillText(text, cx, cy + fontPx * 0.04);
     },
 
+    // 「準備中」の小さな札（名前ラベルのすぐ下）。(cx,cy)＝札の中心、w・h＝札の大きさ
+    topPendingTag: function (ctx, cx, cy, w, h, fontPx) {
+      ctx.fillStyle = "#fff0b8";
+      roundRectPath(ctx, cx - w / 2, cy - h / 2, w, h, h / 2); ctx.fill();
+      ctx.strokeStyle = "rgba(120,84,20,0.75)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+      ctx.font = "bold " + fontPx + "px " + FONT;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#5a3d12";
+      ctx.fillText(PENDING_TAG.text, cx, cy + fontPx * 0.04);
+    },
+
     // 現在地の印。(cx,cy)＝マスの中心
     topPlayer: function (ctx, cx, cy, s, now) {
       const k = (now * 0.9) % 1;                        // 広がる輪
@@ -1652,6 +2206,7 @@
       ctx.lineWidth = 2.5; ctx.stroke();
       ctx.fillStyle = "#3a2a1a";
       ctx.fillText(text, sx, sy + 1);
+      if (isPending(b)) drawPendingTag(ctx, b, sx, sy, h);   // 準備中の建物は、看板の下に小札を吊るす
     },
 
     // 主人公（棒人間＋スケボー）。p＝主人公の状態（位置・向き・動き）
@@ -1981,12 +2536,56 @@
     // 現在地
     const px = L.ox + player.x * s, py = L.oy + player.y * s;
     Art.topPlayer(ctx, px, py, s, now);
-    // 名前ラベル（いちばん上に描く）
-    const fontPx = clamp(Math.round(s * 0.5), 11, 17);
-    BUILDINGS.forEach(function (b) {
-      Art.topLabel(ctx, b.name, L.ox + (b.x + b.size / 2) * s, L.oy + (b.y + b.size / 2) * s, fontPx, false);
+    // 名前ラベル（いちばん上に描く）。準備中の建物は、ラベルの右に「準備中」の札
+    overviewLabels(L).forEach(function (r) {
+      Art.topLabel(ctx, r.b.name, r.cx, r.cy, r.fontPx, false);
+      if (r.tag) Art.topPendingTag(ctx, r.tag.cx, r.tag.cy, r.tag.w, r.tag.h, r.tag.fontPx);
     });
     Art.topLabel(ctx, "現在地", px, py + s * 0.95, clamp(Math.round(s * 0.42), 10, 14), true);
+  }
+
+  // 全体マップの名前ラベルの位置と大きさ（描くときと、押した場所の判定の両方で使う）。
+  // 文字の大きさは1マスの大きさに合わせる（読める大きさの下限 11px）。
+  // 地図が広くてマスが小さいときにラベルどうしが重なったら、後のラベルを下へずらして重ならないようにする
+  function overviewLabels(L) {
+    const s = L.s;
+    const fontPx = clamp(Math.round(s * 0.5), 11, 17);
+    const tagPx = Math.max(11, Math.round(fontPx * 0.8));
+    const TAG_GAP = 2;                                  // ラベルと「準備中」の札のすき間（px）
+    const list = BUILDINGS.map(function (b) {
+      ctx.font = "bold " + fontPx + "px " + FONT;
+      const w = ctx.measureText(b.name).width + fontPx * 0.9, h = fontPx * 1.6;   // Art.topLabel と同じ大きさ
+      const r = { b: b, cx: L.ox + (b.x + b.size / 2) * s, cy: L.oy + (b.y + b.size / 2) * s, w: w, h: h, fontPx: fontPx, tag: null };
+      if (isPending(b)) {
+        ctx.font = "bold " + tagPx + "px " + FONT;
+        r.tag = { w: ctx.measureText(PENDING_TAG.text).width + tagPx * 0.9, h: tagPx * 1.45, fontPx: tagPx, cx: 0, cy: 0 };
+        // 札はラベルの右に横並びにする（縦に積むと、マスが小さいとき建物の色がほとんど隠れるため）。
+        // ラベル＋札のまとまりが、建物の中心に来るように左へずらす
+        r.cx -= (r.tag.w + TAG_GAP) / 2;
+      }
+      return r;
+    });
+    // ラベル（＋札）の四角
+    const box = function (r) {
+      return { x0: r.cx - r.w / 2, x1: r.cx + r.w / 2 + (r.tag ? TAG_GAP + r.tag.w : 0), y0: r.cy - r.h / 2, y1: r.cy + r.h / 2 };
+    };
+    // 重なりをほどく：上から順に置き、先に置いたラベルと重なったら、その下へずらす
+    const order = list.slice().sort(function (a, b) { return a.cy - b.cy || a.cx - b.cx; });
+    const placed = [];
+    order.forEach(function (r) {
+      for (let k = 0; k < 20; k++) {
+        const a = box(r);
+        const hit = placed.filter(function (q) {
+          const c = box(q);
+          return a.x0 < c.x1 + 2 && a.x1 > c.x0 - 2 && a.y0 < c.y1 + 2 && a.y1 > c.y0 - 2;
+        });
+        if (!hit.length) break;
+        r.cy = Math.max.apply(null, hit.map(function (q) { return box(q).y1; })) + 3 + r.h / 2;
+      }
+      placed.push(r);
+    });
+    list.forEach(function (r) { if (r.tag) { r.tag.cx = r.cx + r.w / 2 + TAG_GAP + r.tag.w / 2; r.tag.cy = r.cy; } r.box = box(r); });
+    return list;
   }
 
   // 全体マップの上の点 (px,py) にある建物（無ければ null）。指で押しやすいよう、少し広めに取る
@@ -1996,6 +2595,12 @@
       const b = BUILDINGS[i];
       const x0 = L.ox + b.x * s - m, y0 = L.oy + b.y * s - m, w = b.size * s + m * 2;
       if (px >= x0 && px <= x0 + w && py >= y0 && py <= y0 + w) return b;
+    }
+    // 建物から外れていても、名前ラベル（と準備中の札）の上なら、その建物（マスが小さい広い地図でも押しやすいように）
+    const labels = overviewLabels(L);
+    for (let i = 0; i < labels.length; i++) {
+      const g = labels[i].box;
+      if (px >= g.x0 && px <= g.x1 && py >= g.y0 && py <= g.y1) return labels[i].b;
     }
     return null;
   }
@@ -2060,18 +2665,21 @@
     BUILDINGS.forEach(function (b) {
       const s = buildingShape(b);
       const art = BUILDING_ART[b.art];
-      let body, onSign;
+      let body, onSign, tag = null;
       if (art) {                                        // テーマ別の絵：その絵の外わくと、看板の四角
         const at = art.signAt(s), z = buildingSignSize(ctx, b);
         body = art.outline(s);
         onSign = Math.abs(q.x - at.x) < z.w / 2 + 1 && Math.abs(q.y - at.y) < z.h / 2 + 1;   // ＋1＝ふちの線の分
+        if (isPending(b)) tag = pendingTagRect(ctx, at.x, at.y, z.h);
       } else {                                          // 箱の建物：壁と屋根をまとめた外わくと、てっぺんの看板
         body = [
           s.L, s.F, s.R, { x: s.R.x, y: s.R.y - BUILD.wallH }, s.rR, s.rB, s.rL, { x: s.L.x, y: s.L.y - BUILD.wallH }
         ];
         onSign = Math.abs(q.x - s.apex.x) < signHalfWidth(b) && q.y > s.apex.y - 32 && q.y < s.apex.y;
+        if (isPending(b)) tag = pendingTagRect(ctx, s.apex.x, s.apex.y - 17, 26);
       }
-      if (!insidePoly(q, body) && !onSign) return;
+      const onTag = tag && q.x > tag.x0 - 1 && q.x < tag.x1 + 1 && q.y > tag.y0 && q.y < tag.y1 + 1;   // 準備中の小札
+      if (!insidePoly(q, body) && !onSign && !onTag) return;
       if (!hit || b.x + b.y + b.size > hit.x + hit.y + hit.size) hit = b;
     });
     return hit;
@@ -2084,8 +2692,34 @@
     SOLIDS.push({ key: t.x + t.y + 1, draw: function () { Art.isoTree(ctx, t.x, t.y); }, tree: t });
   });
   BUILDINGS.forEach(function (b) {
-    SOLIDS.push({ key: b.x + b.y + b.size, draw: function (now) { Art.isoBuilding(ctx, b, now); } });
+    SOLIDS.push({ key: b.x + b.y + b.size, draw: function (now) { Art.isoBuilding(ctx, b, now); }, b: b });
   });
+
+  // 建物の絵が収まる四角（斜め画面の座標）。画面の外の建物を描かないための目安。
+  // 絵の外わく・看板・準備中の小札に、広めの余白（煙・旗などの飾りの分）を足す。建物ごとに1回だけ計算して覚えておく
+  const BOUND_PAD = 100;
+  const boundsCache = new Map();
+  function buildingBoundsIso(b) {
+    if (boundsCache.has(b)) return boundsCache.get(b);
+    const s = buildingShape(b), art = BUILDING_ART[b.art];
+    let pts, sx, sy, sw, sh;
+    if (art) {
+      const at = art.signAt(s), z = buildingSignSize(ctx, b);
+      pts = art.outline(s); sx = at.x; sy = at.y; sw = z.w; sh = z.h;
+    } else {
+      pts = [s.rR, s.rB, s.rL, s.rF, s.apex]; sx = s.apex.x; sy = s.apex.y - 17; sw = signHalfWidth(b) * 2; sh = 26;
+    }
+    pts = pts.concat([s.Bk, s.R, s.F, s.L,
+      { x: sx - sw / 2, y: sy - sh / 2 }, { x: sx + sw / 2, y: sy + sh / 2 + PENDING_TAG.gap + PENDING_TAG.h }]);
+    const r = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    pts.forEach(function (p) {
+      r.x0 = Math.min(r.x0, p.x); r.x1 = Math.max(r.x1, p.x);
+      r.y0 = Math.min(r.y0, p.y); r.y1 = Math.max(r.y1, p.y);
+    });
+    r.x0 -= BOUND_PAD; r.x1 += BOUND_PAD; r.y0 -= BOUND_PAD; r.y1 += BOUND_PAD;
+    boundsCache.set(b, r);
+    return r;
+  }
 
   function renderField(now) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2118,6 +2752,10 @@
     // 高さのある物と主人公を、奥（keyが小さい）から順に描く。
     // こうすると、主人公が建物や木の裏に回ったとき、手前の物に隠れる。
     const items = SOLIDS.filter(function (it) {
+      if (it.b) {                                       // 建物：絵の入る四角が画面に入っているときだけ描く
+        const r = buildingBoundsIso(it.b);
+        return r.x1 > minX && r.x0 < maxX && r.y1 > minY && r.y0 < maxY;
+      }
       if (!it.tree) return true;
       const p = iso(it.tree.x, it.tree.y);
       return p.x > minX - 40 && p.x < maxX + 40 && p.y > minY && p.y < maxY + 80;
@@ -2147,8 +2785,20 @@
   let dialogYes = null, dialogNo = null;
   function ask(text, onYes, onNo) {
     ui.dialogText.textContent = text;
+    ui.btnYes.textContent = "はい";                     // 知らせる窓（tell）で変えた文字・ボタンを元に戻す
+    ui.btnNo.hidden = false;
     dialogYes = onYes;
     dialogNo = onNo;
+    ui.dialog.hidden = false;
+    ui.btnYes.focus({ preventScroll: true });
+  }
+  // 知らせるだけの窓（ボタンは「閉じる」1つ。Esc でも閉じる）
+  function tell(text, onClose) {
+    ui.dialogText.textContent = text;
+    ui.btnYes.textContent = "閉じる";
+    ui.btnNo.hidden = true;
+    dialogYes = onClose;
+    dialogNo = onClose;
     ui.dialog.hidden = false;
     ui.btnYes.focus({ preventScroll: true });
   }
@@ -2286,6 +2936,11 @@
 
   // 「入りますか？」を聞く
   function askEnter(b) {
+    if (isPending(b)) {                                 // 準備中（url が無い）：知らせるだけで、中には入らない
+      addLog(b.name + "は、ただいま準備中です（まだ入れません）");
+      tell(b.name + "は、ただいま準備中です", null);
+      return;
+    }
     ask(b.name + "に入りますか？",
       function () { enter(b); },
       function () { addLog(b.name + "の前にいます。行き先は、建物を押すか「全体マップ」で選べます"); });
@@ -2293,13 +2948,24 @@
 
   // 建物に入る（暗転してから、建物の中＝リンク先のサイトを表示する）
   function enter(b) {
+    if (isPending(b)) { askEnter(b); return; }          // 準備中の建物には入らない（入り方が "move" でも、ページを移らない）
     const mode = b.open || C.enterMode || "inside";     // 入り方（config.js の enterMode。建物ごとの open が優先）
+    if (mode === "newtab") {                            // 新しいタブで開く（ポータルはこのタブに、そのまま残る）
+      // 「はい」を押したその場で開く（時間をおいてから開くと、ブラウザに止められるため）。暗転もしない
+      const w = window.open(b.url, "_blank");
+      if (w) {
+        try { w.opener = null; } catch (e) { /* 開いたページから、このページを操作させないため。できなくても開くのは同じ */ }
+        addLog(b.name + "を新しいタブで開きました。このタブに戻れば、ここから続けられます");
+        return;
+      }
+      // ブラウザに止められて開けなかったとき：下の流れで、同じタブで移る
+    }
     state.leaving = true;
     addLog(b.name + "に入ります");
     stopBgm();
     ui.fade.classList.add("on");
     setTimeout(function () {
-      if (mode === "move") {                            // 同じタブでサイトそのものへ移る
+      if (mode === "move" || mode === "newtab") {       // 同じタブでサイトそのものへ移る（新しいタブを止められたときも）
         window.location.href = b.url;
         return;
       }

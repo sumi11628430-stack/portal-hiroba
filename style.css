@@ -291,3 +291,8 @@ body {
   color: #cfd5f0;
   font-size: 14px;
 }
+.link-list .link-pending {             /* 準備中の建物（リンクにしない） */
+  color: #9aa3cf;
+  font-size: 17px;
+  font-weight: 700;
+}

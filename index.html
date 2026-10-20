@@ -77,10 +77,19 @@
   var list = document.getElementById("linkList");
   CONFIG.buildings.forEach(function (b) {
     var li = document.createElement("li");
-    var a = document.createElement("a");
-    a.href = b.url;
-    a.textContent = b.name;
-    li.appendChild(a);
+    if (b.url && String(b.url).trim()) {
+      var a = document.createElement("a");
+      a.href = b.url;
+      if (b.open === "newtab") { a.target = "_blank"; a.rel = "noopener"; }   // 新しいタブで開く建物は、リンクも新しいタブで
+      a.textContent = b.name;
+      li.appendChild(a);
+    } else {
+      // 準備中（url が空、または書かれていない建物）：リンクにせず、名前と（準備中）を出す
+      var n = document.createElement("strong");
+      n.className = "link-pending";
+      n.textContent = b.name + "（準備中）";
+      li.appendChild(n);
+    }
     if (b.desc) {
       var s = document.createElement("span");
       s.textContent = b.desc;
