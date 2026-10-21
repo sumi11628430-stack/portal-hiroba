@@ -8,6 +8,7 @@
 //   4. 音（効果音。BGMは空の関数だけ）
 //   5. 描く部品（★画像に差し替えるときは、ここの関数の中身を替える）
 //   6. 主人公（動きの流れ）
+//  6b. 動物（★カメラ試作で足した物。絵の置き場 ANIMAL_ART と、動き）
 //   7. 画面を描く（全体マップ／移動画面）
 //   8. 画面の部品（メッセージ窓・ログ・ボタン）
 //   9. 流れ（選ぶ → 向かう → 着く → 入る）
@@ -343,6 +344,9 @@
     clack: function () { this.burst("bandpass", 1900, 0.04, 0.22); },  // 道の継ぎ目の「カタッ」
     brake: function () { this.burst("bandpass", 900, 0.24, 0.55); },   // 止まる「ザザッ」
     step: function () { this.burst("lowpass", 200, 0.08, 0.7); },      // 板から降りる「トン」
+    // ★技（config.js の tricks）で足した音
+    pop: function () { this.burst("bandpass", 2400, 0.05, 0.85); this.burst("lowpass", 700, 0.06, 0.6); },    // 板の後ろを弾く「パン」
+    land: function () { this.burst("lowpass", 520, 0.16, 1.0); this.burst("bandpass", 1500, 0.12, 0.45); },  // 着地の「ガシャッ」
 
     // ♪ボタン：音の入／切
     toggle: function () {
@@ -1863,6 +1867,86 @@
     return { A: m.A + nA / nl * h, B: m.B + nB / nl * h, z: m.z + nz / nl * h };
   }
 
+  // ------------------------------------------------------------
+  // ★技（config.js の tricks）：オーリー・キックフリップの体と板の動き
+  //   p.trick ＝ { kind: "ollie"｜"kickflip", t: 始めてからの秒数, Tc: しゃがむ秒数, Ta: 空中の秒数, Tl: 着地を受ける秒数,
+  //               H: 板の高さ（マス）, Hpx: 同じ高さ（体の px）, flipDir: 回す向き（+1／-1） }
+  //   技が無いとき（p.trick が null）は、ここの関数は呼ばれない（今までと同じ姿勢）。
+  // ------------------------------------------------------------
+  const TRICK_CROUCH = 0.16;     // しゃがむ（ためる）秒数
+  const TRICK_LAND = 0.2;        // 着地をひざで受ける秒数
+
+  // 技のいまの段階。crouch しゃがむ／air 空中／land 着地を受ける（k＝その段階の中の進み具合 0〜1）
+  function trickPhase(tr) {
+    if (tr.t < tr.Tc) return { name: "crouch", k: tr.t / tr.Tc };
+    if (tr.t < tr.Tc + tr.Ta) return { name: "air", k: (tr.t - tr.Tc) / tr.Ta };
+    return { name: "land", k: clamp((tr.t - tr.Tc - tr.Ta) / tr.Tl, 0, 1) };
+  }
+
+  // 板の動き：hb＝板の持ち上がり（px）、pitch＝板の先の上がり（ラジアン）、flip＝長い軸のまわりの回転（ラジアン）
+  function trickBoard(tr) {
+    const ph = trickPhase(tr), top = tr.kind === "kickflip" ? 0.36 : 0.46;
+    let hb = 0, pitch = 0, flip = 0;
+    if (ph.name === "crouch") {
+      pitch = top * ease(clamp((ph.k - 0.65) / 0.35, 0, 1));            // 最後に、後ろ足で板の後ろを踏み込む
+    } else if (ph.name === "air") {
+      const u = ph.k;
+      hb = tr.Hpx * 4 * u * (1 - u);                                    // 放物線（いちばん高いのは空中の真ん中）
+      pitch = u < 0.08 ? top : top * (1 - ease(clamp((u - 0.08) / 0.34, 0, 1)));   // 弾いて先が上がる → 前足で引き上げて水平に
+      if (tr.kind === "kickflip") flip = Math.PI * 2 * ease(clamp((u - 0.1) / 0.58, 0, 1)) * tr.flipDir;   // 長い軸のまわりに1回転
+    }
+    return { hb: hb, pitch: pitch, flip: flip };
+  }
+
+  // 板の中の点（前A・右B・上z）を、技の板の動きで動かす。withFlip＝回転も入れるか（足の位置は回転させない）
+  function trickBoardPoint(bd, A, B, z, withFlip) {
+    if (withFlip && bd.flip) {                          // 長い軸（板の厚みの真ん中）のまわりに回す
+      const zc = BODY.deckZ, c = Math.cos(bd.flip), s = Math.sin(bd.flip);
+      const b2 = B * c - (z - zc) * s, z2 = zc + B * s + (z - zc) * c;
+      B = b2; z = z2;
+    }
+    if (bd.pitch) {                                     // 後ろの車輪の接地点を支点にして、板の先を上げる
+      const pa = -8.5, c = Math.cos(bd.pitch), s = Math.sin(bd.pitch);
+      const a2 = pa + (A - pa) * c - z * s, z2 = (A - pa) * s + z * c;
+      A = a2; z = z2;
+    }
+    return { A: A, B: B, z: z + bd.hb };
+  }
+
+  function lerpJoint(a, b, k) { return { A: lerp(a.A, b.A, k), B: lerp(a.B, b.B, k), z: lerp(a.z, b.z, k) }; }
+
+  // 技の間の体：しゃがむ → 後ろ足で弾く → 空中で足を引き上げる（板が足についてくる）→ ひざで着地を受ける。
+  // c0・f0・footF0・footB0＝ふだんの姿勢の値（しゃがみ始めと、着地のあとは、ここへなめらかにつなぐ）
+  function trickBody(p, c0, f0, footF0, footB0) {
+    const tr = p.trick, ph = trickPhase(tr), bd = trickBoard(tr);
+    const top = BODY.deckZ + 1;
+    const onBoard = function (A, B, up) { const q = trickBoardPoint(bd, A, B, top, false); q.z += up || 0; return q; };
+    const lift = trickBoardPoint(bd, 0, 0, top, false).z - top;     // 板の真ん中の持ち上がり（体もいっしょに上がる）
+    let crouch, fwd, arms, footF, footB;
+    if (ph.name === "crouch") {
+      const k = ease(ph.k);
+      crouch = lerp(c0, 1, k); fwd = lerp(f0, 2.5, k); arms = 1 + 0.2 * k;
+      footF = lerpJoint(footF0, onBoard(lerp(6.5, 1.5, k), 0), k);   // 前足は板の真ん中へ
+      footB = lerpJoint(footB0, onBoard(lerp(-6.5, -10.5, k), 0), k);   // 後ろ足は板の後ろの端（テール）へ
+    } else if (ph.name === "air") {
+      const u = ph.k;
+      crouch = u < 0.15 ? 1 - 0.45 * Math.sin(Math.PI * u / 0.15) : (u < 0.7 ? 1 : lerp(1, 0.8, (u - 0.7) / 0.3));   // 弾く瞬間だけ脚が伸び、すぐ引き上げる
+      fwd = 2; arms = 1.25;
+      const kick = tr.kind === "kickflip" ? Math.sin(Math.PI * clamp((u - 0.05) / 0.3, 0, 1)) : 0;    // キックフリップ：前足で板の横をはらう
+      const up = tr.kind === "kickflip" ? 5 * Math.sin(Math.PI * clamp((u - 0.08) / 0.62, 0, 1)) : 0;  // 回っている間は、足を板から少し離す
+      const aF = u < 0.3 ? lerp(1.5, 7, ease(u / 0.3)) : lerp(7, 6.5, ease(clamp((u - 0.3) / 0.5, 0, 1)));   // 前足を板の先へすべらせる
+      const aB = lerp(-10.5, -6.5, ease(clamp(u / 0.5, 0, 1)));
+      footF = onBoard(aF, 4 * kick, up);
+      footB = onBoard(aB, 0, up);
+    } else {
+      const k = ease(ph.k);
+      crouch = lerp(1, c0, k); fwd = lerp(2, f0, k); arms = lerp(1.25, 1, k);
+      footF = lerpJoint(onBoard(6.5, 0), footF0, k);
+      footB = lerpJoint(onBoard(-6.5, 0), footB0, k);
+    }
+    return { crouch: crouch, fwd: fwd, arms: arms, footF: footF, footB: footB, lift: lift };
+  }
+
   // 主人公の姿勢を決める。
   // 体の中の点は「前へ A・右へ B・上へ z」（px）で表す。板の中心が A=0, B=0。
   //   p.mode ＝ idle 立っている／mount 乗る／push 蹴る／glide 滑る／brake 減速／dismount 降りる
@@ -1913,9 +1997,16 @@
     footF = { A: lerp(footF.A, 2.4, oF), B: lerp(footF.B, BODY.side, oF), z: lerp(footF.z, 0, oF) + arc(oF) };
     footB = { A: lerp(footB.A, -2.4, oB), B: lerp(footB.B, BODY.side, oB), z: lerp(footB.z, 0, oB) + arc(oB) };
 
+    // ★技（オーリー・キックフリップ）の間は、ひざ・上体・腕・足を技の動きに替え、体ごと持ち上げる（技が無いときは何もしない）
+    let lift = 0;
+    if (p.trick) {
+      const tb = trickBody(p, crouch, fwd, footF, footB);
+      crouch = tb.crouch; fwd = tb.fwd; arms = tb.arms; footF = tb.footF; footB = tb.footB; lift = tb.lift;
+    }
+
     const hipRide = deckTop + 21.5 * (1 - 0.3 * crouch);
     const hipStand = 22.6 + Math.sin(now * 2.2) * 0.3;  // 立っているときは、ゆっくり呼吸
-    const hip = { A: hipA * (1 - off), B: BODY.side * ease(off) + lean * 2, z: lerp(hipRide, hipStand, off) };
+    const hip = { A: hipA * (1 - off), B: BODY.side * ease(off) + lean * 2, z: lerp(hipRide, hipStand, off) + lift };
     const neck = { A: hip.A + fwd, B: hip.B + lean * 5, z: hip.z + BODY.torso };
     const head = { A: neck.A + fwd * 0.3, B: neck.B + lean * 1.5, z: neck.z + BODY.headR + 1.2 };
     const sh = { A: neck.A, B: neck.B, z: neck.z - 1.5 };
@@ -2249,14 +2340,21 @@
         const zAt = function (A, B) {
           return BODY.deckZ - roll * (B / BODY.deckW) + (Math.abs(A) > BODY.deckLen - 3 ? 1.2 : 0);   // 先と後ろは少し反る
         };
+        // ★技の間は、板の点を技の動き（持ち上がり・先の上がり・回転）で動かしてから写す（技が無いときは P のまま）
+        const bd = p.trick ? trickBoard(p.trick) : null;
+        const Pb = bd ? function (A, B, z) { const q = trickBoardPoint(bd, A, B, z, true); return P(q.A, q.B, q.z); } : P;
+        const upside = bd ? Math.cos(bd.flip) < 0 : false;          // 裏返っている間は、車輪が上（板の後に描く）・板は裏の色
         // 車輪
-        ctx.fillStyle = "#f4efe2";
-        ctx.strokeStyle = "#2a2a2a";
-        ctx.lineWidth = 1.2 * k;
-        [[8.5, 3.4], [8.5, -3.4], [-8.5, 3.4], [-8.5, -3.4]].forEach(function (w) {
-          const q = P(w[0], w[1], 1.9);
-          ctx.beginPath(); ctx.arc(q.x, q.y, 2.2 * k, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-        });
+        const wheels = function () {
+          ctx.fillStyle = "#f4efe2";
+          ctx.strokeStyle = "#2a2a2a";
+          ctx.lineWidth = 1.2 * k;
+          [[8.5, 3.4], [8.5, -3.4], [-8.5, 3.4], [-8.5, -3.4]].forEach(function (w) {
+            const q = Pb(w[0], w[1], 1.9);
+            ctx.beginPath(); ctx.arc(q.x, q.y, 2.2 * k, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+          });
+        };
+        if (!upside) wheels();
         // 板（両はしが丸い形）
         const out = [];
         const cA = BODY.deckLen - BODY.deckW;
@@ -2268,9 +2366,10 @@
           const a = Math.PI / 2 + Math.PI * i / 6;
           out.push([-cA + Math.cos(a) * BODY.deckW, Math.sin(a) * BODY.deckW]);
         }
-        const pts = out.map(function (o) { return P(o[0], o[1], zAt(o[0], o[1])); });
-        fillPoly(ctx, pts, C.player.boardColor);
+        const pts = out.map(function (o) { return Pb(o[0], o[1], zAt(o[0], o[1])); });
+        fillPoly(ctx, pts, upside ? shade(C.player.boardColor, -0.45) : C.player.boardColor);
         ctx.strokeStyle = "#2a2a2a"; ctx.lineWidth = 1.3 * k; ctx.stroke();
+        if (upside) wheels();
       };
 
       // 棒人間（線と円）
@@ -2325,7 +2424,12 @@
     dist: 0,               // 道のりを進んだ長さ
     kicks: 2,              // 蹴る回数
     kickNo: -1,            // いま何回目の蹴りか
-    onArrive: null         // 着いたときに呼ぶ処理
+    onArrive: null,        // 着いたときに呼ぶ処理
+    trick: null,           // ★いま出している技（オーリー・キックフリップ。無ければ null）
+    carve: null,           // ★カーブでよけている道のり（道のりからの横のずれの予定。無ければ null）
+    carveOx: 0,            // ★カーブで、道のりから横へずれている量（地図の x・y。カメラが使う）
+    carveOy: 0,
+    carveYaw: 0            // ★カーブで、道のりの向きから体の向きがずれている量（ラジアン。カメラが使う）
   };
 
   function setMode(mode) { player.mode = mode; player.t = 0; }
@@ -2355,6 +2459,7 @@
 
     p.route = route;
     p.dist = 0;
+    if (p.carve) trickEndCarve(p);                       // ★新しい道のりは、いまの位置（カーブでずれた所）から始まるので、カーブの予定は消す
 
     if (riding) {
       // 滑っている途中の行き先変更
@@ -2397,6 +2502,8 @@
     p.speed = 0;
     p.lean = 0;
     p.off = 1;
+    p.trick = null;                                     // ★技・カーブも、途中でやめる
+    if (p.carve) trickEndCarve(p);
     setMode("idle");
     Sound.setRoll(0, true);
   }
@@ -2458,25 +2565,37 @@
       if (p.mode === "glide") setMode("brake");
     }
 
+    // ★技（tricks.enabled のときだけ）：技の時間を進め、通り道の動物を見て、跳ぶ／カーブでよけるを決める
+    if (TRK.on) trickUpdate(p, dt);
+
     // 進む
     p.dist = Math.min(p.route.total, p.dist + p.speed * dt);
     const q = routeAt(p.route, p.dist);
-    if (Math.floor(q.x) !== Math.floor(p.x) || Math.floor(q.y) !== Math.floor(p.y)) Sound.clack();   // マスの境目で「カタッ」
-    p.x = q.x;
-    p.y = q.y;
+    let nx = q.x, ny = q.y, qa = q.ang;
+    if (p.carve) {                                      // ★カーブでよけている間は、道のりから横へずらす（向きも、ずれの変わり方に合わせる）
+      const o = trickCarveAt(p.carve, p.dist);
+      p.carveOx = -Math.sin(q.ang) * o.off; p.carveOy = Math.cos(q.ang) * o.off; p.carveYaw = Math.atan(o.slope);
+      nx += p.carveOx; ny += p.carveOy; qa += p.carveYaw;
+      if (p.dist >= p.carve.s3) trickEndCarve(p);
+    }
+    if (Math.floor(nx) !== Math.floor(p.x) || Math.floor(ny) !== Math.floor(p.y)) Sound.clack();   // マスの境目で「カタッ」
+    p.x = nx;
+    p.y = ny;
 
     // 向きは道のりの向きを少し遅れて追いかける。その遅れ（＝曲がり具合）で体を傾ける
-    const lag = p.route.total > 0.01 ? angDiff(q.ang, p.heading) : 0;
+    const lag = p.route.total > 0.01 ? angDiff(qa, p.heading) : 0;
     p.heading += lag * (1 - Math.exp(-dt * 16));
     const leanTo = clamp(lag * 2.6, -1, 1) * clamp(p.speed / (p.vmax * 0.5), 0, 1);
     const rate = Math.abs(leanTo) > Math.abs(p.lean) ? 14 : 4.5;     // 傾くのは速く、戻るのはゆっくり
     p.lean += (leanTo - p.lean) * (1 - Math.exp(-dt * rate));
 
-    Sound.setRoll(p.speed / (C.walkSpeed * C.skateMultiplier), tileAt(Math.floor(p.x), Math.floor(p.y)) === T.ROAD);
+    Sound.setRoll(trickInAir(p) ? 0 : p.speed / (C.walkSpeed * C.skateMultiplier), tileAt(Math.floor(p.x), Math.floor(p.y)) === T.ROAD);   // ★跳んでいる間は滑走音を止める
 
     // 着いた
     if (p.route.total - p.dist <= 0.002) {
       const end = p.route.pts[p.route.pts.length - 1];
+      p.trick = null;                                   // ★技・カーブの途中でも、ここで終える（ふつうは着く前に終わっている）
+      if (p.carve) trickEndCarve(p);
       p.dist = p.route.total;
       p.x = end.x;
       p.y = end.y;
@@ -2486,6 +2605,3508 @@
       p.offFrom = 0;
       setMode("dismount");
     }
+  }
+
+  // ------------------------------------------------------------
+  // 6a. ★スケボーの技で動物をよける（config.js の tricks）
+  //    進んでいる間（push 蹴る・glide 滑る・brake 減速）に、これから通る道のりの上に地面の動物
+  //    （猫・ウサギ・地面にいるスズメ・柴犬）がいれば、オーリー／キックフリップで飛び越えるか、体を傾けてカーブでよける。
+  //    ・跳ぶ：いちばん高い所で動物の真上を通るように、始める時を速さから逆算する（柴犬・遅い時・着く直前は跳ばない）
+  //    ・カーブ：動物と反対側へふくらみ、横を carveGap マス以上あけて通り、着く前に道のりへ戻る（ふくらむ先が通れなければ反対側、両側とも通れなければオーリー）
+  //    ・跳ぶこともカーブもできない時（行き先の入口の前に座っている など）は、動物のほうが横へよける（スズメは群れで飛び立つ）
+  //    ・歩いている時・止まっている時は、動物のほうが主人公から約0.5マスの中へ入らない（止まる・押しのけられる）
+  //    判断の乱数は決まった種（tricks.seed）から作るので、同じ step の進め方なら毎回同じになる。
+  //    tricks.enabled が false なら、ここは何もしない（今までと同じ動き）。空を飛ぶスズメ・ちょうちょ・池のアヒルは、よける対象にしない。
+  // ------------------------------------------------------------
+  const TRK = Object.assign({ seed: 1, kickflipRate: 1 / 3, minJumpSpeed: 1.6, carveGap: 0.6 }, C.tricks || {});
+  TRK.on = !!(C.tricks && C.tricks.enabled === true);
+  const TRICK_H = 1 / 60;        // 先読みの刻み（秒）
+  const TRICK_AHEAD = 1.6;       // 先読みする長さ（秒）
+  const TRICK_NEAR = 0.5;        // 道のりがこれより動物に近づくなら、よける（マス）
+  const TRICK_CLEAR = 0.45;      // 跳ぶとき、踏み切りと着地の位置で動物からあける距離（マス）
+  const TRICK_KEEP = 0.5;        // 歩いている・止まっている主人公から、動物があける距離（マス）
+  const TRICK_KEEP_RIDE = 0.42;  // 滑っている主人公から、動物があける最後の守り（技・カーブでよけきれなかった時だけ押しのける）
+  const trickRand = makeRand(Number(TRK.seed) || 1);
+  // 技の回数の記録（確かめ用。PORTAL_DEBUG.trickStats）
+  const trickStats = { ollie: 0, kickflip: 0, forcedOllie: 0, carve: 0, yield: 0, pushRiding: 0, pushWalking: 0, pushIdle: 0, stopped: 0, log: [] };
+  function trickLog(what, a) {
+    trickStats.log.push({ t: +state.time.toFixed(2), what: what, animal: a ? a.kind : "", at: a ? [+a.x.toFixed(2), +a.y.toFixed(2)] : null });
+    if (trickStats.log.length > 200) trickStats.log.shift();
+  }
+
+  // よける対象の動物か（地面にいる猫・ウサギ・柴犬・スズメ）
+  function trickTarget(a) {
+    if (a.kind === "cat" || a.kind === "rabbit" || a.kind === "shiba") return true;
+    return a.kind === "sparrow" && !a.air;
+  }
+
+  // t 秒後の動物の位置の見込み（いま向かっている先へ、いまの速さで進むとする）。飛び立った後なら null
+  function trickAnimalAt(a, t) {
+    if (a.kind === "sparrow" && a.delay >= 0 && t > a.delay) return null;
+    if (!a.hold && (a.state === "walk" || a.state === "run" || a.state === "hop")) {
+      const dx = a.tx - a.x, dy = a.ty - a.y, dist = Math.hypot(dx, dy);
+      if (dist > 0.01) { const m = Math.min(dist, a.spd * t) / dist; return { x: a.x + dx * m, y: a.y + dy * m }; }
+    }
+    return { x: a.x, y: a.y };
+  }
+
+  // 技の空中か／板の底の高さ（マス）
+  function trickInAir(p) { return !!p.trick && trickPhase(p.trick).name === "air"; }
+  function trickAir(p) {
+    if (!p.trick) return 0;
+    const ph = trickPhase(p.trick);
+    return ph.name === "air" ? p.trick.H * 4 * ph.k * (1 - ph.k) : 0;
+  }
+
+  // 飛び越える高さ（マス）：動物の絵の高さ（耳・しっぽの上まで）＋0.12（猫・ウサギ 約0.5。柴犬なら肩 約0.33マスより十分高い上限 0.55）
+  // 確かめ後の手直し：前は「絵の高さの8割＋0.1」で、猫・ウサギの真上の余裕が約0.02マス（約1px）しかなかった
+  const TRICK_HMAX = 0.55;       // 板の高さの上限（マス）
+  function trickJumpHeight(a) {
+    return clamp(trickArtH(a) + 0.12, 0.25, TRICK_HMAX);
+  }
+  // 動物の絵の高さ（マス）
+  function trickArtH(a) {
+    const art = ANIMAL_ART[a.kind];
+    return art ? art.size.h / ART_PX : 0.3;
+  }
+
+  // これからの道のりの見込み（TRICK_H 秒ごと）。速さは、いまの速さのまま（行き先が近づけば、減速の上限で下がる）。カーブ中は横のずれも入れる
+  function trickForecast(p, n) {
+    const route = p.route, cur = route.cursor, out = [];
+    let s = p.speed, d = p.dist;
+    for (let i = 0; i <= n; i++) {
+      if (i > 0) {
+        const cap = Math.sqrt(2 * C.brakeDecel * Math.max(0, route.total - d)) + 0.3;
+        if (s > cap) s = cap;
+        d = Math.min(route.total, d + s * TRICK_H);
+      }
+      const q = routeAt(route, d);
+      let x = q.x, y = q.y;
+      if (p.carve) { const o = trickCarveAt(p.carve, d).off; x += -Math.sin(q.ang) * o; y += Math.cos(q.ang) * o; }   // カーブ中は、横のずれも入れる
+      out.push({ d: d, v: s, x: x, y: y, ang: q.ang });
+    }
+    route.cursor = cur;                                 // 道のりの読み位置を元に戻す
+    return out;
+  }
+
+  // カーブの横のずれ（右が＋）と、その変わり方（ずれ÷道のり）。s＝道のりの位置
+  function trickCarveAt(c, s) {
+    if (s <= c.s0 || s >= c.s3) return { off: 0, slope: 0 };
+    if (s < c.s1) { const u = (s - c.s0) / (c.s1 - c.s0); return { off: c.O * ease(u), slope: c.O * 6 * u * (1 - u) / (c.s1 - c.s0) }; }
+    if (s <= c.s2) return { off: c.O, slope: 0 };
+    const u = (s - c.s2) / (c.s3 - c.s2);
+    return { off: c.O * (1 - ease(u)), slope: -c.O * 6 * u * (1 - u) / (c.s3 - c.s2) };
+  }
+  function trickEndCarve(p) { p.carve = null; p.carveOx = 0; p.carveOy = 0; p.carveYaw = 0; }
+
+  // カーブの道すじが、ずっと通れるマスの上か（体の幅のぶん、左右も見る）
+  function trickCarveClear(route, c) {
+    const cur = route.cursor;
+    let ok = true;
+    for (let s = c.s0; s <= c.s3 + 1e-6 && ok; s += 0.08) {
+      const q = routeAt(route, s), o = trickCarveAt(c, s).off;
+      const rx = -Math.sin(q.ang), ry = Math.cos(q.ang);
+      for (let w = -1; w <= 1 && ok; w++) {
+        const x = q.x + rx * (o + w * 0.18), y = q.y + ry * (o + w * 0.18);
+        if (!isWalkable(Math.floor(x), Math.floor(y))) ok = false;
+      }
+    }
+    route.cursor = cur;
+    return ok;
+  }
+
+  // カーブの予定を作る（動物と反対側へふくらむ。通れなければ反対側。どちらも通れなければ null）
+  function trickCarvePlan(p, fc, th, others, ths) {
+    const a = th.a;
+    // 確かめ後の手直し：すぐ先（2.5マス以内）にも道のりの上の動物がいれば、まとめて同じ側でよける（1回のふくらみで両方の横を通る）
+    const list = [th];
+    (ths || []).forEach(function (u) { if (u !== th && fc[u.i].d - fc[th.i].d <= 2.5) list.push(u); });
+    const ps = list.map(function (u) {
+      const f = fc[u.i], q = trickAnimalAt(u.a, u.i * TRICK_H);
+      const dx = Math.cos(f.ang), dy = Math.sin(f.ang);
+      return { sA: f.d + (q.x - f.x) * dx + (q.y - f.y) * dy,     // 動物の横を通る、道のりの位置
+               lat: -(q.x - f.x) * dy + (q.y - f.y) * dx,         // 動物の、道のりからの横のずれ（右が＋）
+               G: TRK.carveGap + ANIMAL_KIND[u.a.kind].margin };  // 体の中心どうしであける距離（動物の体の幅の半分を足す）
+    });
+    const lat = ps[0].lat;
+    const sAmin = Math.min.apply(null, ps.map(function (u) { return u.sA; })), sAmax = Math.max.apply(null, ps.map(function (u) { return u.sA; }));
+    const total = p.route.total;
+    const sides = lat > 0 ? [-1, 1] : [1, -1];
+    for (let n = 0; n < 2; n++) {
+      const O = sides[n] < 0 ? Math.min.apply(null, ps.map(function (u) { return u.lat - u.G; })) : Math.max.apply(null, ps.map(function (u) { return u.lat + u.G; }));
+      const L = clamp(Math.abs(O) * 1.8, 0.8, 1.6);
+      let s1 = Math.min.apply(null, ps.map(function (u) { return u.sA - u.G - 0.15; })), s0 = s1 - L;
+      let s2 = Math.max.apply(null, ps.map(function (u) { return u.sA + u.G + 0.15; })), s3 = s2 + L;
+      if (s0 < p.dist) { s0 = p.dist; if (s1 < s0 + 0.5) s1 = s0 + 0.5; }   // ふくらみ始めが遅れたときは、短く寄る
+      if (s3 > total - 0.1) { s3 = total - 0.1; if (s2 > s3 - 0.4) s2 = s3 - 0.4; }   // 着く前に、道のりへ戻り切る
+      if (s2 < s1 || s1 > sAmin - 0.25 || s2 < sAmax + 0.25) continue;   // 動物の横を、ふくらみ切って通れない（間に合わない・着く直前）
+      const plan = { s0: s0, s1: s1, s2: s2, s3: s3, O: O, target: a, group: list.map(function (u) { return u.a; }) };
+      if (trickCarveClear(p.route, plan) && trickCarveFree(fc, plan, others)) return plan;
+    }
+    return null;
+  }
+
+  // 確かめ後の手直し：カーブの道すじが、よける相手のほかの地面の動物にも近づかないか（0.5マス＋その動物の体の幅の半分）
+  // 前は、よける相手1匹しか見ず、並んで座っている別の動物に、カーブの先で0.14〜0.26マスまで近づくことがあった
+  function trickCarveFree(fc, c, others) {
+    for (let n = 0; n < others.length; n++) {
+      const b = others[n];
+      if (c.group.indexOf(b) >= 0) continue;
+      const G = TRICK_NEAR + ANIMAL_KIND[b.kind].margin;
+      for (let i = 0; i < fc.length; i += 2) {
+        const f = fc[i];
+        if (f.d < c.s0 || f.d > c.s3) continue;
+        const q = trickAnimalAt(b, i * TRICK_H);
+        if (!q) continue;
+        const o = trickCarveAt(c, f.d).off;
+        if (Math.hypot(f.x - Math.sin(f.ang) * o - q.x, f.y + Math.cos(f.ang) * o - q.y) < G) return false;
+      }
+    }
+    return true;
+  }
+
+  // 技を始める
+  function trickStart(p, a, H, Ta, forced, group) {
+    const kind = trickRand() < TRK.kickflipRate ? "kickflip" : "ollie";
+    p.trick = { kind: kind, t: 0, Tc: TRICK_CROUCH, Ta: Ta, Tl: TRICK_LAND, H: H, Hpx: H * ART_PX / C.player.scale, flipDir: 1, target: a, popped: false, landed: false,
+                targets: group || [a] };                 // 確かめ後の手直し：飛び越える動物の全部（着地まで逃げずに身をすくめ、着地のあとで驚いて逃げる）
+    if (p.mode === "push") setMode("glide");            // 蹴っている途中なら、蹴るのをやめて板に両足を乗せる
+    trickStats[kind]++;
+    if (forced) trickStats.forcedOllie++;
+    trickLog(kind + (forced ? "（両側とも通れず）" : ""), a);
+  }
+
+  // 確かめ後の手直し：跳ぶ相手に決めた動物は、着地するまで逃げない（その場で身をすくめる）。
+  // 前は、猫が逃げ出す距離（2マス）と技を始める距離がほぼ同じで、跳んだ時には猫が逃げていて真上を越えないことが半分あった。
+  // braceT＝跳ぶと決めて待っている間の印（毎回のばす。跳ばないことになれば、すぐ切れて、ふだんの反応に戻る）
+  function trickBraced(a) {
+    if (!TRK.on) return false;
+    if ((a.braceT || 0) > state.time) return true;
+    const tr = player.trick;
+    return !!tr && !tr.landed && tr.targets.indexOf(a) >= 0;
+  }
+  function trickBrace(list) {
+    list.forEach(function (a) { a.braceT = state.time + 0.25; });
+  }
+  // 確かめ後の手直し：スズメの群れが降りる所として、主人公のそば（2マス）と、これから通る道のり（1.8マス）のそばを選ばない。
+  // 前は、空中にいる間に板の真下へ降りてきたり、止まっている主人公の0.5マスの所へ降りて押しのけで一瞬で動いたりした
+  function trickLandBad(x, y) {
+    const p = player;
+    if (Math.hypot(x - p.x, y - p.y) < 2) return true;
+    if (!p.route) return false;
+    const cur = p.route.cursor;
+    let bad = false;
+    for (let s = p.dist; s <= p.route.total + 1e-6 && !bad; s += 0.5) {
+      const q = routeAt(p.route, s);
+      if (Math.hypot(x - q.x, y - q.y) < 1.8) bad = true;
+    }
+    p.route.cursor = cur;                               // 道のりの読み位置を元に戻す
+    return bad;
+  }
+
+  // 板を弾いたとき：跳ぶ相手にしたスズメの群れは、弾いた音（パン）で飛び立つ
+  function trickPopTakeoff(tr) {
+    tr.targets.forEach(function (a) {
+      if (a.kind === "sparrow" && a.flock && !a.air && a.delay < 0) flockTakeoff(a.flock, { x: player.x, y: player.y });
+    });
+  }
+
+  // 着地のとき：飛び越えた猫・ウサギが、まだ逃げていなければ驚いて逃げる
+  function trickStartle(a) {
+    if (!a || a.hold || (a.kind !== "cat" && a.kind !== "rabbit") || a.react === "flee") return;
+    const t = animalFleeTarget(a, rndIn(a.rnd, 1.6, 2.6));
+    if (t) { a.react = "flee"; animalGo(a, t, ANIMAL_KIND[a.kind].run, a.kind === "cat" ? "run" : "hop"); }
+  }
+
+  // 跳ぶこともカーブもできないとき（行き先の入口の前に座っている など）：動物のほうが、道のりから横へよける
+  // （猫・ウサギは小走りで、柴犬は歩いて、道のりから0.75マス以上離れた所へ。スズメは群れで飛び立つ）
+  function trickYield(a, fc) {
+    if (a.hold || (a.yieldT || 0) > state.time) return false;
+    if (a.kind === "sparrow") {
+      if (!a.flock || a.delay >= 0) return false;
+      a.cool = 0; flockTakeoff(a.flock, { x: player.x, y: player.y });
+      a.yieldT = state.time + 1;
+      trickStats.yield++; trickLog("yield（飛び立つ）", a);
+      return true;
+    }
+    let best = null, bestScore = Infinity;
+    for (let k = 0; k < 16; k++) {
+      const ang = k / 16 * Math.PI * 2;
+      for (let r = 0.7; r <= 1.71; r += 0.5) {
+        const x = a.x + Math.cos(ang) * r, y = a.y + Math.sin(ang) * r;
+        let dm = Infinity;
+        for (let i = 0; i < fc.length; i += 2) dm = Math.min(dm, Math.hypot(fc[i].x - x, fc[i].y - y));
+        if (dm < 0.75) continue;
+        if (!animalOk(a, x, y) || !animalLineOk(a, a.x, a.y, x, y)) continue;
+        const score = r - Math.min(dm, 1.5) * 0.3;        // 近くで、道のりから離れた所
+        if (score < bestScore) { bestScore = score; best = { x: x, y: y }; }
+      }
+    }
+    if (!best) return false;
+    const K = ANIMAL_KIND[a.kind];
+    a.yieldT = state.time + 1.5;
+    if (a.kind === "shiba") { a.react = null; a.cool = Math.max(a.cool, 2); animalGo(a, best, K.walk * 2, "walk"); }
+    else { a.react = "flee"; animalGo(a, best, K.run, a.kind === "cat" ? "run" : "hop"); }
+    trickStats.yield++; trickLog("yield（横へよける）", a);
+    return true;
+  }
+
+  // 板を弾いたとき：着地する所へ向かって動いている動物（逃げる向きが道の先だった猫など）は、音に驚いて横へよける
+  function trickClearLanding(p, tr) {
+    const fc = trickForecast(p, Math.round((tr.Ta + 0.3) / TRICK_H));
+    const iDown = Math.min(fc.length - 1, Math.round(tr.Ta / TRICK_H));
+    animals.forEach(function (a) {
+      if (!trickTarget(a) || Math.hypot(a.x - p.x, a.y - p.y) > 4) return;
+      if (tr.targets.indexOf(a) >= 0) return;            // 飛び越える相手は、その場で身をすくめたまま
+      for (let i = iDown; i < fc.length; i += 3) {
+        const q = trickAnimalAt(a, i * TRICK_H);
+        if (q && Math.hypot(fc[i].x - q.x, fc[i].y - q.y) < TRICK_KEEP) { trickYield(a, fc.slice(iDown)); return; }
+      }
+    });
+  }
+
+  // 進んでいる間に毎回呼ぶ：技の時間を進め、空中でなければ、通り道の動物を見て決める
+  // （跳ぶ → カーブ → 両側とも通れなければオーリー → どれもできなければ動物のほうがよける。カーブ中は、跳ぶか動物がよけるだけ）
+  function trickUpdate(p, dt) {
+    if (p.trick) {
+      const tr = p.trick;
+      tr.t += dt;
+      if (!tr.popped && tr.t >= tr.Tc) { tr.popped = true; Sound.pop(); trickPopTakeoff(tr); trickClearLanding(p, tr); }   // 後ろ足で板を弾く「パン」
+      if (!tr.landed && tr.t >= tr.Tc + tr.Ta) { tr.landed = true; Sound.land(); tr.targets.forEach(trickStartle); }   // 着地の「ガシャッ」
+      if (tr.t >= tr.Tc + tr.Ta + tr.Tl) {
+        p.trick = null;
+        // 蹴っている途中で跳んだときは、着地のあと、もう1回蹴って速さを戻す（着く時間が遅れないように）
+        if (p.mode === "glide" && p.speed < p.vmax - 0.05 && p.route.total - p.dist > 3) { p.kicks = 1; p.kickNo = -1; setMode("push"); }
+      }
+      else if (!tr.landed) return;                        // 空中の間は、次を決めない（着地を受けている間は、次の技・カーブを始めてよい）
+    }
+    if (p.speed < 0.05) return;
+    const reach = p.speed * TRICK_AHEAD + 2;
+    const near = animals.filter(function (a) { return trickTarget(a) && Math.hypot(a.x - p.x, a.y - p.y) < reach; });
+    if (!near.length) return;
+    const fc = trickForecast(p, Math.round(TRICK_AHEAD / TRICK_H));
+
+    // 道のりが近づく動物（いちばん近づく時の順）
+    const ths = [];
+    near.forEach(function (a) {
+      let mi = -1, md = Infinity;
+      for (let i = 0; i < fc.length; i++) {
+        const q = trickAnimalAt(a, i * TRICK_H);
+        if (!q) break;
+        const d = Math.hypot(fc[i].x - q.x, fc[i].y - q.y);
+        if (d < md) { md = d; mi = i; }
+      }
+      if (mi > 0 && md < TRICK_NEAR) ths.push({ a: a, i: mi, d: md });   // いちばん近いのが「いま」なら、もう横を過ぎている
+    });
+    if (!ths.length) return;
+    ths.sort(function (u, v) { return u.i - v.i; });
+    const th = ths[0], a = th.a;
+    // 行き先の入口（止まる所）のすぐそばにいる動物は、跳んでもカーブでもよけきれないので、動物のほうがよける
+    const end = p.route.pts[p.route.pts.length - 1], qa = trickAnimalAt(a, th.i * TRICK_H);
+    if (Math.hypot(qa.x - end.x, qa.y - end.y) < 0.8) {
+      if (th.i * TRICK_H <= 0.9 || Math.hypot(a.x - p.x, a.y - p.y) < 2) trickYield(a, fc);
+      return;
+    }
+
+    // 跳ぶ：続けて並んでいる動物（空中で越えられる間隔）は、まとめて1回で越える。いちばん高い所を、その真ん中に合わせる
+    const half0 = Math.round(clamp(0.42 + trickJumpHeight(a) * 0.3, 0.45, 0.6) / 2 / TRICK_H);
+    let last = th.i;
+    ths.forEach(function (u) { if (u.i - th.i <= half0 * 1.1) last = Math.max(last, u.i); });
+    // 跳びの予定（lastI＝まとめて越える最後の動物の位置、big＝高さ・空中の時間を上限にする）
+    const mkPlan = function (lastI, big) {
+      let H = trickJumpHeight(a);
+      ths.forEach(function (u) { if (u.i <= lastI) H = Math.max(H, trickJumpHeight(u.a)); });
+      const pk = Math.round((th.i + lastI) / 2);
+      // 動物も同じ向きへ逃げている時など、近づく速さが遅いときは、真上の前後（0.35マス）で板が低くならないように、
+      // 空中の時間を延ばし（0.6秒まで）、それでも足りなければ高さを上限（TRICK_HMAX）にする
+      let Ta = clamp(0.42 + H * 0.3, 0.45, 0.6);
+      if (pk - 6 >= 0 && pk + 6 < fc.length) {
+        const q1 = trickAnimalAt(a, (pk - 6) * TRICK_H), q2 = trickAnimalAt(a, (pk + 6) * TRICK_H);
+        if (q1 && q2) {
+          const vc = (Math.hypot(fc[pk - 6].x - q1.x, fc[pk - 6].y - q1.y) + Math.hypot(fc[pk + 6].x - q2.x, fc[pk + 6].y - q2.y)) / (12 * TRICK_H);
+          const need = 0.35 / Math.max(vc, 0.1) / 0.18;
+          if (need > Ta) { Ta = Math.min(0.6, need); if (need > 0.6) H = TRICK_HMAX; }
+        }
+      }
+      if (big) { H = TRICK_HMAX; Ta = 0.6; }
+      const half = Math.round(Ta / 2 / TRICK_H), tPeak = TRICK_CROUCH + Ta / 2;   // 始めてから、いちばん高くなるまで
+      const tNow = pk * TRICK_H;                         // いまから、動物の真上（いちばん近い所）を通るまで
+      return { H: H, Ta: Ta, pk: pk, tPeak: tPeak, tNow: tNow, iUp: pk - half, iDown: pk + half, s0: Math.max(0, Math.round((tNow - tPeak) / TRICK_H)) };
+    };
+    // 確かめ後の手直し：空中で、どの動物の上でも板（車輪の下）が動物の高さより上にあるか（真上で＋0.08マス、前後0.45マスで＋0.02マス）。
+    // 板と動物が上から見て重なる範囲（進む向きに前後0.45マス・横0.23マス＝板の幅の半分0.11＋動物の体の幅の半分）で調べる。
+    // 前は、2匹をまとめて越えると1匹目の真上で板が低く、猫・ウサギに食い込むことがあった
+    const clearOk = function (pl) {
+      for (let i = pl.s0; i < fc.length; i++) {
+        const k = ((i - pl.s0) * TRICK_H - TRICK_CROUCH) / pl.Ta;
+        if (k > 1) break;
+        const h = k > 0 ? pl.H * 4 * k * (1 - k) : 0;
+        const ux = Math.cos(fc[i].ang), uy = Math.sin(fc[i].ang);
+        for (let n = 0; n < near.length; n++) {
+          const q = trickAnimalAt(near[n], i * TRICK_H);
+          if (!q) continue;
+          const along = Math.abs((q.x - fc[i].x) * ux + (q.y - fc[i].y) * uy), side = Math.abs(-(q.x - fc[i].x) * uy + (q.y - fc[i].y) * ux);
+          if (along < 0.45 && side < 0.23 && h < trickArtH(near[n]) + 0.02 + 0.06 * (1 - along / 0.45)) return false;
+        }
+      }
+      return true;
+    };
+    let pl = mkPlan(last, false);
+    if (!clearOk(pl)) pl = mkPlan(last, true);
+    if (!clearOk(pl) && last > th.i) {                   // まとめて越えられない間隔：1匹目だけを越える予定にする
+      last = th.i; pl = mkPlan(last, false);
+      if (!clearOk(pl)) pl = mkPlan(last, true);
+    }
+    const clear = clearOk(pl);
+    const H = pl.H, Ta = pl.Ta, pk = pl.pk, tPeak = pl.tPeak, tNow = pl.tNow, iUp = pl.iUp, iDown = pl.iDown;
+    const group = ths.filter(function (u) { return u.i <= last; }).map(function (u) { return u.a; });
+    const dist = function (f, q) { return Math.hypot(f.x - q.x, f.y - q.y); };
+    const jumpable = function (force) {
+      if (!clear) return false;                                                     // 空中で、動物の上を板が十分高く通れない
+      if (iDown >= fc.length || fc[iDown].d > p.route.total - 0.6) return false;   // 着地が、行き先の手前に収まらない
+      if (!force && fc[pk].v < TRK.minJumpSpeed) return false;                     // 遅すぎて、跳んでも越えきれない
+      // 確かめ後の手直し：着地のすぐ後（0.5秒以内）に道のりの上の次の動物が来るときは跳ばない（カーブで、まとめてよける）
+      if (!force && ths.some(function (u) { return u.i > last && u.i <= iDown + Math.round(0.5 / TRICK_H); })) return false;
+      for (let n = 0; n < near.length; n++) {                                       // 踏み切る所・着地する所に、動物がいない
+        const qu = iUp >= 0 ? trickAnimalAt(near[n], iUp * TRICK_H) : null, qd = trickAnimalAt(near[n], iDown * TRICK_H);
+        if (qu && dist(fc[iUp], qu) < TRICK_CLEAR) return false;
+        if (qd && dist(fc[iDown], qd) < TRICK_CLEAR) return false;
+      }
+      return true;
+    };
+    const shibaIn = ths.some(function (u) { return u.i <= last && u.a.kind === "shiba"; });
+    if (!shibaIn && jumpable(false)) {
+      if (tNow >= tPeak - 0.12) trickBrace(group);        // 跳ぶ相手は、逃げずに身をすくめて待つ
+      if (tNow > tPeak + TRICK_H * 0.5) return;           // まだ早い（いちばん高い所で真上を通るように、始める時を待つ）
+      if (tNow >= tPeak - 0.12) { trickStart(p, a, H, Ta, false, group); return; }
+    }
+    if (p.carve) {                                        // カーブ中に、ほかの動物（または動いた動物）が道すじに入った：跳べなければ、動物のほうがよける
+      if (th.i * TRICK_H <= 0.9) trickYield(a, fc);
+      return;
+    }
+    // カーブでよける（動物の横を通る所の前後を、ふくらんだまま通れる予定のときだけ）
+    const plan = trickCarvePlan(p, fc, th, near, ths);
+    if (plan) {
+      if (plan.s0 > p.dist + p.speed * TRICK_H * 1.5) return;   // まだ早い（ふくらみ始める所まで待つ）
+      p.carve = plan;
+      trickStats.carve++;
+      trickLog("carve", a);
+      return;
+    }
+    if (jumpable(true)) {                                 // 両側とも通れない：オーリーで越える
+      if (tNow >= tPeak - 0.12) trickBrace(group);
+      if (tNow > tPeak + TRICK_H * 0.5) return;
+      if (tNow >= tPeak - 0.12) { trickStart(p, a, Math.max(H, 0.4), Ta, true, group); return; }
+    }
+    if (th.i * TRICK_H <= 0.9) trickYield(a, fc);          // どれもできない：動物のほうが横へよける
+  }
+
+  // ★動物が、主人公の近くへ歩いて入らない（止まる）。(nx,ny)＝動物が次に進む位置
+  function trickKeepOut(a, nx, ny) {
+    if (!trickTarget(a) || trickInAir(player)) return false;
+    const dn = Math.hypot(nx - player.x, ny - player.y);
+    return dn < TRICK_KEEP && dn < Math.hypot(a.x - player.x, a.y - player.y);
+  }
+
+  // ★主人公のすぐそばにいる動物を、押しのける（歩いている・止まっている時は約0.5マス、滑っている時は最後の守りとして0.42マス）
+  function trickPushAway(a) {
+    if (!trickTarget(a) || a.hold) return;
+    const p = player;
+    if (trickInAir(p)) return;                          // 真上を飛び越えている間は、そのまま
+    const riding = p.mode === "push" || p.mode === "glide" || p.mode === "brake";
+    const keep = riding ? TRICK_KEEP_RIDE : TRICK_KEEP;
+    const dx = a.x - p.x, dy = a.y - p.y, d = Math.hypot(dx, dy);
+    // 降りたばかり（まだ反応しない間）のスズメも、滑ってくる主人公が1.2マスまで来たら、群れで飛び立つ
+    if (a.kind === "sparrow" && riding && a.delay < 0 && a.flock && d < 1.2 && !trickBraced(a)) {
+      flockTakeoff(a.flock, { x: p.x, y: p.y });
+      if (a.delay > 0) a.delay = 0;
+      trickStats.yield++; trickLog("yield（飛び立つ）", a);
+      if (d >= keep) return;                            // すぐそばに降りてきたときは、飛び立つ前に下の押しのけも行う
+    }
+    if (d >= keep) { if (d > keep + 0.2) a.pushed = false; return; }
+    const ang = d > 1e-4 ? Math.atan2(dy, dx) : a.heading + Math.PI;
+    const turns = [0, 0.5, -0.5, 1, -1, 1.5, -1.5, 2.2, -2.2];
+    for (let i = 0; i < turns.length; i++) {
+      const x = p.x + Math.cos(ang + turns[i]) * keep, y = p.y + Math.sin(ang + turns[i]) * keep;
+      if (animalOk(a, x, y)) {
+        a.x = x; a.y = y;
+        if (!a.pushed) {
+          a.pushed = true;
+          if (riding) trickStats.pushRiding++; else if (p.mode === "idle") trickStats.pushIdle++; else trickStats.pushWalking++;
+          trickLog("push（" + p.mode + " 速さ" + p.speed.toFixed(2) + (p.trick ? " " + p.trick.kind : "") + (p.carve ? " carve" : "") + " 残り" + (p.route ? (p.route.total - p.dist).toFixed(2) : "-") + "）", a);
+        }
+        return;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------
+  // 6b. 動物（★カメラ試作で足した物。config.js の animals）
+  //    歩き回る動物を置き、主人公が近づくと反応させる。
+  //    描くのは移動画面の背中ごし（renderFollow）と斜め見下ろし（renderField）だけ。全体マップには出さない。
+  //    この節＝絵の置き場（ANIMAL_ART）と、動き（位置・状態・向き）。描く所は 7. の両方の画面から呼ぶ。
+  //    animals.enabled が false なら、動物は1匹も作らず、どの画面も今までと同じに描く。
+  // ------------------------------------------------------------
+
+  // 動物の絵の置き場。決まりの形：
+  //   ANIMAL_ART.<種類> = {
+  //     size: { w: 横幅px, h: 高さpx },   // 斜め見下ろしの絵の物差し（ART_PX＝45px が1マス）。右向きの横向きで、足元から頭（耳・しっぽ）の上まで
+  //     states: ["idle", "walk", ...],    // 描ける状態（無い状態を頼まれたときは、仕組みの側で近い状態に置き換える。ANIMAL_STATE_FALLBACK）
+  //     draw: function (ctx, s) { ... }   // ctx の原点＝足元の中心（地面に触れる所）。上が −y。右向きの横向きが基本
+  //   };
+  //   s ＝ { state: 状態, phase: 0〜1（歩く・羽ばたくなどの周期の中の位置）, t: 秒, view: "side" | "front" | "back",
+  //          seed: 0〜1（個体ごとの値）, variant: 種類の中の毛色の名前 }
+  //   左向きは、仕組みの側で ctx.scale(-1, 1) をかけてから draw を呼ぶ（絵の側で左右反転はしない）。
+  //   影（地面の楕円）は仕組みの側で描く（絵の側では描かない）。飛んでいる時の高さも仕組みの側で上へずらす。
+  //   種類の名前：sparrow（スズメ）・shiba（柴犬）・cat（猫）・butterfly（ちょうちょ）・rabbit（ウサギ）・duck（アヒル）
+  //   variant：sparrow＝"suzume"／shiba＝"aka"／cat＝"chatora"｜"mike"｜"hachiware"／butterfly＝"monshiro"｜"ageha"／rabbit＝"nousagi"／duck＝"ahiru"
+  const ANIMAL_ART = Object.create(null);   // 元からの名前（constructor など）を持たない入れ物
+
+  // ============================================================
+  // ★動物の絵（ここから）
+  //   3人の絵の担当が描いた絵（スズメ・ちょうちょ／柴犬・猫／ウサギ・アヒル）。
+  //   差し替えるときは「★動物の絵（ここから）」〜「★動物の絵（ここまで）」を丸ごと入れ替える（ANIMAL_ART の決まりの形を守れば、ほかは変えなくて済む）。
+  //   組み込みのときに変えた所には「組み込みで」と書いてある。
+  // ============================================================
+
+  // ------------------------------------------------------------
+  // 動物の絵：スズメ（sparrow）
+  //   中の寸法は「本物の mm」で描き、最後に MM（1mm＝何px）をかけて斜め見下ろしの px にする。
+  //   本物の比率（主人公＝約1.6m＝1.4マス）だと小さすぎて見えないので、2倍の大きさにしてある。
+  //   高さはそのまま上へ、奥行きは半分（斜め見下ろしの地面のつぶれ）で画面に出す。
+  // ------------------------------------------------------------
+  ANIMAL_ART.sparrow = (function () {
+    const MM = 2 * 45 * 1.4 / 1600;           // 1mm＝何px（2倍の大きさ。45px＝1マス、1.6m＝1.4マス）
+    const OL = "rgba(40,30,20,0.55)";         // 輪郭の色（COLORS.outline と同じ）
+    const PAL = {
+      cap: "#9a6038",        // 頭のてっぺん（栗色）
+      cheek: "#f4f0e6",      // 白いほお
+      black: "#2a221c",      // ほおの黒い点・のどの黒
+      back: "#a8784a",       // 背中の茶
+      streak: "#4a3322",     // 背中の黒いまだら
+      edge: "#d6b282",       // 羽のふちの明るい色
+      wing: "#9c6b40",       // 羽（雨おおい）
+      bar: "#f2ecdf",        // 羽の白い帯
+      prim: "#55402e",       // 風切り羽（黒っぽい茶）
+      belly: "#ddd5c7",      // おなか（明るい灰色）
+      flank: "#c7b8a2",      // わき腹（少し茶色がかった灰色）
+      under: "#d3cabd",      // 羽の裏
+      tail: "#6b4e36",       // 尾
+      beak: "#2c2826",       // くちばし
+      leg: "#b48e78",        // 足
+      eye: "#1a1410"
+    };
+
+    // 0〜1 の決まった乱数（同じ値からは毎回同じ答え）
+    function rnd(a, b) {
+      const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+      return s - Math.floor(s);
+    }
+    function ease(x) { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); }
+    // 色を明るく（k＞0）・暗く（k＜0）する
+    function tone(hex, k) {
+      const n = parseInt(hex.slice(1), 16);
+      const f = function (c) { return Math.round(k > 0 ? c + (255 - c) * k : c * (1 + k)); };
+      return "rgb(" + f(n >> 16) + "," + f((n >> 8) & 255) + "," + f(n & 255) + ")";
+    }
+    // 輪郭の太さ（mm）。画面上で約0.8pxになるようにし、体に対して太くなりすぎないよう上下を決める
+    function lineMM(ctx) {
+      let sc = MM;
+      if (ctx.getTransform) { const m = ctx.getTransform(); sc = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || MM; }
+      return Math.max(1.4, Math.min(4, 0.8 / sc));
+    }
+    function ell(ctx, x, y, rx, ry, rot) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot || 0, 0, Math.PI * 2); }
+
+    // 体の中の点（前 f・左 l・上 z。mm）を画面に直す。view ごとに奥行きの向きが変わる
+    function proj(view, f, l, z) {
+      if (view === "front") return { x: l, y: -z + f * 0.5 };
+      if (view === "back") return { x: -l, y: -z - f * 0.5 };
+      return { x: f, y: -z - l * 0.5 };
+    }
+
+    // 状態から姿勢を決める
+    function poseOf(s) {
+      const ph = s.phase || 0, t = s.t || 0, sd = s.seed || 0;
+      const p = { lift: 0, pitch: 0, neck: 0, dip: 0, yaw: 0, tilt: 0, legs: "stand", tail: 0, fly: false, theta: 0, blink: false };
+      const bt = (t + sd * 7.3) % 3.7;
+      p.blink = bt < 0.11;
+      if (s.state === "walk") {                          // 小さく跳ねながら進む（スズメは地面を両足で跳ねて歩く）
+        const u = Math.sin(Math.PI * ph);
+        p.lift = 5 * u; p.pitch = 0.06; p.legs = u > 0.35 ? "tuck" : "bend"; p.tail = 0.06 * u;
+      } else if (s.state === "hop") {                    // 大きく両足で跳ねる
+        const u = Math.sin(Math.PI * ph);
+        p.lift = 18 * u; p.pitch = -0.12 * Math.cos(Math.PI * ph); p.legs = u > 0.25 ? "tuck" : "bend"; p.tail = 0.12 * u;
+      } else if (s.state === "peck") {                   // 首を下げて地面をつつく
+        const k = ph < 0.42 ? ease(ph / 0.42) : (ph < 0.58 ? 1 : ease((1 - ph) / 0.42));
+        const tap = ph > 0.42 && ph < 0.58 ? Math.sin((ph - 0.42) / 0.16 * Math.PI * 2) * 0.05 : 0;
+        p.pitch = 0.5 * k + tap; p.neck = 21 * k; p.tilt = 0.6 * k; p.dip = k; p.tail = 0.2 * k; p.legs = "bend";
+      } else if (s.state === "fly") {                    // 羽ばたき。phase＝0 で羽が上、0.5 で下
+        p.fly = true; p.legs = "fold"; p.pitch = -0.05;
+        p.theta = (8 + 57 * Math.cos(Math.PI * 2 * ph)) * Math.PI / 180;
+      } else {                                           // idle：きょろきょろ・尾をぴくっと動かす
+        const slot = Math.floor(t / 1.15 + sd * 5);
+        p.yaw = (rnd(slot, sd) - 0.5) * 1.6;
+        p.tilt = (rnd(slot + 3, sd) - 0.5) * 0.25;
+        const ft = (t + sd * 3.1) % 2.3;
+        p.tail = ft < 0.18 ? Math.sin(ft / 0.18 * Math.PI) * 0.25 : 0;
+        p.lift = 0;
+      }
+      return p;
+    }
+
+    // 足（横向き）。x＝付け根の前後位置
+    function legSide(ctx, x, mode, lw) {
+      ctx.strokeStyle = PAL.leg; ctx.lineWidth = 2.4; ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath();
+      if (mode === "tuck") {                             // 跳んでいる間：たたむ
+        ctx.moveTo(x, -16); ctx.lineTo(x - 4, -9); ctx.lineTo(x + 4, -7);
+      } else if (mode === "bend") {                      // かがむ
+        ctx.moveTo(x, -16); ctx.lineTo(x - 3, -7); ctx.lineTo(x + 1, 0);
+        ctx.moveTo(x + 1, 0); ctx.lineTo(x + 8, 0); ctx.moveTo(x + 1, 0); ctx.lineTo(x - 5, 0.5);
+      } else {
+        ctx.moveTo(x, -16); ctx.lineTo(x - 1.5, -8); ctx.lineTo(x + 1, 0);
+        ctx.moveTo(x + 1, 0); ctx.lineTo(x + 8, 0); ctx.moveTo(x + 1, 0); ctx.lineTo(x - 5, 0.5);
+      }
+      ctx.stroke();
+    }
+
+    // 羽を広げた形（飛ぶ時）。u＝付け根から先へ、v＝前へ（mm）
+    function wingPath(ctx) {
+      ctx.beginPath();
+      ctx.moveTo(0, 9);
+      ctx.bezierCurveTo(18, 13, 40, 12, 58, 3);          // 前のふち
+      ctx.lineTo(68, -4);                                 // 羽の先
+      ctx.lineTo(63, -10); ctx.lineTo(64, -12);           // 風切り羽のぎざぎざ
+      ctx.lineTo(56, -16); ctx.lineTo(57, -18.5);
+      ctx.lineTo(48, -21); ctx.lineTo(48.5, -23.5);
+      ctx.lineTo(38, -25); ctx.lineTo(37, -27);
+      ctx.bezierCurveTo(26, -28, 12, -27, 0, -20);       // 後ろのふち
+      ctx.closePath();
+    }
+    // 広げた羽を1枚描く。root＝付け根（体の中の点）、side＝左 +1／右 −1
+    function flapWing(ctx, view, root, side, theta, pitch, lw) {
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const S = { f: -Math.sin(theta) * sp, l: side * Math.cos(theta), z: Math.sin(theta) * cp };   // 羽の先へ向かう向き
+      const F = { f: cp, l: 0, z: sp };                                                              // 前の向き
+      const a = proj(view, S.f, S.l, S.z), c = proj(view, F.f, F.l, F.z);
+      const o0 = proj(view, 0, 0, 0), r = proj(view, root.f, root.l, root.z);
+      const ax = a.x - o0.x, ay = a.y - o0.y, cx = c.x - o0.x, cy = c.y - o0.y;
+      // 表が見えているか：羽を水平に広げた時（表が上）と、今の向きの裏返りを比べる
+      const a0 = proj(view, 0, side, 0);
+      const det0 = (a0.x - o0.x) * cy - (a0.y - o0.y) * cx, det = ax * cy - ay * cx;
+      const top = det * det0 > 0;
+      ctx.save();
+      ctx.transform(ax, ay, cx, cy, r.x, r.y);
+      wingPath(ctx);
+      ctx.restore();
+      ctx.fillStyle = top ? PAL.prim : PAL.under; ctx.fill();
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      if (top) {
+        // 表の模様：付け根側の茶色・白い帯・風切り羽のふち
+        ctx.save();
+        ctx.transform(ax, ay, cx, cy, r.x, r.y);
+        wingPath(ctx); ctx.clip();
+        ctx.fillStyle = PAL.wing;
+        ctx.beginPath(); ctx.moveTo(-2, 12); ctx.bezierCurveTo(20, 15, 34, 14, 42, 9); ctx.lineTo(30, -8); ctx.bezierCurveTo(20, -14, 8, -14, -2, -10); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = PAL.back;
+        ctx.beginPath(); ctx.moveTo(-2, 12); ctx.bezierCurveTo(10, 14, 20, 14, 24, 11); ctx.lineTo(16, 0); ctx.lineTo(-2, 0); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = PAL.bar;
+        ctx.beginPath(); ctx.moveTo(2, -1); ctx.bezierCurveTo(14, -3, 26, -5, 34, -9); ctx.lineTo(32, -12); ctx.bezierCurveTo(24, -9, 13, -6, 2, -4); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = PAL.edge; ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        [[38, 6, 62, -8], [34, 2, 54, -15], [30, -1, 45, -20], [24, -14, 36, -24], [14, -15, 22, -26]].forEach(function (q) { ctx.moveTo(q[0], q[1]); ctx.lineTo(q[2], q[3]); });
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // 頭（横向き）。中心 (hx, hy)、yaw＝こちらへ顔を向ける量（−1〜1）
+    function headSide(ctx, hx, hy, p, lw) {
+      const R = 13.5, yw = Math.max(-0.8, Math.min(0.8, p.yaw));
+      ctx.save();
+      ctx.translate(hx, hy); ctx.rotate(p.tilt);
+      // くちばし（顔をこちらへ向けると短く見える）
+      const bl = 12 * Math.cos(yw * 0.9), by = 2 + yw * 2;
+      ctx.fillStyle = PAL.beak;
+      ctx.beginPath(); ctx.moveTo(R - 2.5, by - 4.2); ctx.quadraticCurveTo(R - 1 + bl * 0.6, by - 3.5, R - 1 + bl, by + 0.3); ctx.lineTo(R - 2.5, by + 3.4); ctx.closePath(); ctx.fill();
+      // 頭の丸
+      ell(ctx, 0, 0, R, R * 0.95);
+      ctx.fillStyle = PAL.cheek; ctx.fill();
+      ctx.save(); ctx.clip();
+      // 頭のてっぺんの栗色
+      ctx.fillStyle = PAL.cap;
+      ctx.beginPath(); ctx.moveTo(-R - 2, 3); ctx.bezierCurveTo(-6, -2, 4, -4, R + 2, -1); ctx.lineTo(R + 2, -R - 2); ctx.lineTo(-R - 2, -R - 2); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = tone(PAL.cap, 0.18);
+      ell(ctx, -1, -8.5, 7, 3.2, -0.15); ctx.fill();
+      // 目から くちばしへの黒い線・のどの黒
+      ctx.fillStyle = PAL.black;
+      ctx.beginPath(); ctx.moveTo(3, -1.5); ctx.lineTo(R + 1, by - 3); ctx.lineTo(R + 1, by + 3); ctx.lineTo(6, 3); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(4, 6); ctx.quadraticCurveTo(9, 4, R + 1, by + 2); ctx.lineTo(R + 2, R + 2); ctx.lineTo(2, R + 2); ctx.closePath(); ctx.fill();
+      // ほおの黒い点
+      ell(ctx, -3 - yw * 2, 3.5, 3.6, 3.1); ctx.fill();
+      // 陰（下と後ろを少し暗く）
+      ctx.fillStyle = "rgba(60,40,20,0.12)";
+      ell(ctx, -4, 9, 12, 6); ctx.fill();
+      ctx.restore();
+      ell(ctx, 0, 0, R, R * 0.95);
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // 目
+      const ex = 4.5 + yw * 1.5, ey = -1.5;
+      if (p.blink) {
+        ctx.strokeStyle = PAL.eye; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(ex - 2, ey); ctx.lineTo(ex + 2, ey); ctx.stroke();
+      } else {
+        ctx.fillStyle = PAL.eye; ell(ctx, ex, ey, 2.2, 2.3); ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.9)"; ell(ctx, ex + 0.7, ey - 0.8, 0.7, 0.7); ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // 背中のまだら（体の形で切り抜いた中に描く）
+    //   rot＝まだらの向き（横向きは体にそって横、後ろ・正面は縦）
+    function streaks(ctx, sd, x0, x1, y0, y1, n, rot) {
+      const r = rot === undefined ? -0.15 : rot, cr = Math.cos(r), sr = Math.sin(r);
+      for (let i = 0; i < n; i++) {
+        const x = x0 + (x1 - x0) * ((i + rnd(i, sd) * 0.6) / n);
+        const y = y0 + (y1 - y0) * rnd(i + 9, sd);
+        const rr = r + (rnd(i + 4, sd) - 0.5) * 0.3;
+        ctx.fillStyle = PAL.streak;
+        ell(ctx, x, y, 5.5, 1.6, rr); ctx.fill();
+        ctx.fillStyle = "rgba(214,178,130,0.75)";
+        ell(ctx, x - 2.2 * sr - 1.2 * cr, y + 2.2 * cr - 1.2 * sr, 4.2, 1, rr); ctx.fill();
+      }
+    }
+
+    // 横向き（右向き）
+    function drawSide(ctx, p, sd, lw) {
+      ctx.translate(0, -p.lift);
+      const shoulder = { f: 10, l: 0, z: 40 };
+      if (p.fly) flapWing(ctx, "side", { f: shoulder.f, l: 6, z: shoulder.z }, 1, p.theta, p.pitch, lw);   // 向こう側の羽
+      if (p.legs !== "fold") { legSide(ctx, -5, p.legs, lw); legSide(ctx, 3, p.legs, lw); }
+      ctx.save();
+      ctx.translate(0, -16); ctx.rotate(p.pitch); ctx.translate(0, 16);   // 腰を中心に体を前へ倒す
+      // 尾
+      ctx.save();
+      ctx.translate(-28, -32); ctx.rotate(-0.1 - p.tail);
+      ctx.beginPath(); ctx.moveTo(4, -7); ctx.lineTo(-38, -10); ctx.lineTo(-42, -8); ctx.lineTo(-40.5, -5.5); ctx.lineTo(-43, -2); ctx.lineTo(-38, -0.5); ctx.lineTo(2, 7); ctx.closePath();
+      ctx.fillStyle = PAL.tail; ctx.fill();
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      ctx.strokeStyle = tone(PAL.tail, 0.35); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(-6, -2); ctx.lineTo(-40, -5); ctx.stroke();
+      ctx.restore();
+      // 胴
+      const bodyPath = function () { ell(ctx, -3, -33, 31, 20.5, -0.2); };
+      bodyPath(); ctx.fillStyle = PAL.belly; ctx.fill();
+      ctx.save(); bodyPath(); ctx.clip();
+      ctx.fillStyle = PAL.flank; ell(ctx, -10, -24, 26, 9, -0.2); ctx.fill();
+      ctx.fillStyle = PAL.back;
+      ctx.beginPath(); ctx.moveTo(-40, -30); ctx.bezierCurveTo(-20, -36, 0, -40, 26, -43); ctx.lineTo(26, -60); ctx.lineTo(-40, -60); ctx.closePath(); ctx.fill();
+      streaks(ctx, sd, -30, 14, -48, -40, 6);
+      ctx.fillStyle = "rgba(255,250,240,0.22)"; ell(ctx, 8, -38, 14, 7, -0.3); ctx.fill();      // 胸の明るさ
+      ctx.fillStyle = "rgba(60,40,20,0.14)"; ell(ctx, -6, -16, 30, 8, -0.2); ctx.fill();         // 下の陰
+      ctx.restore();
+      bodyPath(); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // たたんだ羽
+      if (!p.fly) {
+        const wingPathF = function () {
+          ctx.beginPath(); ctx.moveTo(16, -44); ctx.bezierCurveTo(4, -48, -22, -44, -46, -36);
+          ctx.quadraticCurveTo(-30, -27, -8, -27); ctx.bezierCurveTo(6, -28, 16, -34, 16, -44); ctx.closePath();
+        };
+        wingPathF(); ctx.fillStyle = PAL.wing; ctx.fill();
+        ctx.save(); wingPathF(); ctx.clip();
+        ctx.fillStyle = PAL.prim;                                     // 風切り羽（後ろの先）
+        ctx.beginPath(); ctx.moveTo(-6, -40); ctx.lineTo(-50, -38); ctx.lineTo(-20, -24); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = PAL.edge; ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        [[-8, -36, -42, -35], [-6, -32, -36, -31], [-4, -29, -26, -28]].forEach(function (q) { ctx.moveTo(q[0], q[1]); ctx.lineTo(q[2], q[3]); });
+        ctx.stroke();
+        for (let i = 0; i < 5; i++) {                                 // 雨おおいの黒い芯と明るいふち
+          const x = 12 - i * 6, y = -41 + i * 0.5 + (i % 2) * 1.8;
+          ctx.fillStyle = PAL.streak; ell(ctx, x, y, 2.8, 1.5, -0.2); ctx.fill();
+          ctx.fillStyle = PAL.edge; ell(ctx, x - 1, y + 1.8, 2.6, 0.8, -0.2); ctx.fill();
+        }
+        ctx.fillStyle = PAL.bar;                                      // 白い帯
+        ctx.beginPath(); ctx.moveTo(14, -37); ctx.quadraticCurveTo(0, -36, -14, -34); ctx.lineTo(-14, -32); ctx.quadraticCurveTo(0, -34, 14, -35); ctx.closePath(); ctx.fill();
+        ctx.restore();
+        wingPathF(); ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.8; ctx.stroke();
+      }
+      // 頭（つつく時は首をのばす）
+      const hx = 23 + p.neck * 0.6, hy = -50 + p.neck;
+      if (p.neck > 1) {                                               // のびた首
+        ctx.lineCap = "round";
+        ctx.strokeStyle = PAL.belly; ctx.lineWidth = 20;
+        ctx.beginPath(); ctx.moveTo(14, -36); ctx.lineTo(hx - 2, hy); ctx.stroke();
+        ctx.strokeStyle = PAL.back; ctx.lineWidth = 9;
+        ctx.beginPath(); ctx.moveTo(10, -45); ctx.lineTo(hx - 5, hy - 5); ctx.stroke();
+        ctx.lineCap = "butt";
+      }
+      headSide(ctx, hx, hy, p, lw);
+      ctx.restore();
+      if (p.fly) flapWing(ctx, "side", { f: shoulder.f, l: -6, z: shoulder.z }, -1, p.theta, p.pitch, lw);  // 手前の羽
+    }
+
+    // 正面（こちらへ来る）
+    function drawFront(ctx, p, sd, lw) {
+      const k = p.dip;                                   // つつく深さ（0〜1）
+      ctx.translate(0, -p.lift);
+      if (p.fly) { flapWing(ctx, "front", { f: 6, l: 7, z: 40 }, 1, p.theta, p.pitch, lw); flapWing(ctx, "front", { f: 6, l: -7, z: 40 }, -1, p.theta, p.pitch, lw); }
+      // 尾（体の向こう、上に少し見える）
+      const tailY = -64 - 6 * k;
+      ctx.fillStyle = PAL.tail;
+      ctx.beginPath(); ctx.moveTo(-3, -50); ctx.quadraticCurveTo(-8, -57, -6, tailY); ctx.quadraticCurveTo(0, tailY - 4, 6, tailY); ctx.quadraticCurveTo(8, -57, 3, -50); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // 足
+      if (p.legs !== "fold" && p.legs !== "tuck") {
+        ctx.strokeStyle = PAL.leg; ctx.lineWidth = 2.4; ctx.lineCap = "round";
+        ctx.beginPath();
+        [-5, 5].forEach(function (x) { ctx.moveTo(x, -14); ctx.lineTo(x * 1.1, 0); ctx.moveTo(x * 1.1, 0); ctx.lineTo(x * 1.1 - 2, 3); ctx.moveTo(x * 1.1, 0); ctx.lineTo(x * 1.1 + 2, 3); });
+        ctx.stroke();
+      }
+      // 胴（上に背中の茶色、下に胸の灰色）
+      const bodyPath = function () { ell(ctx, 0, -34, 20, 22); };
+      bodyPath(); ctx.fillStyle = PAL.belly; ctx.fill();
+      ctx.save(); bodyPath(); ctx.clip();
+      ctx.fillStyle = PAL.back;
+      ell(ctx, 0, -56 + 6 * k, 22, 14 + 8 * k); ctx.fill();
+      streaks(ctx, sd, -12, 10, -54, -46 + 4 * k, 4, 1.45);
+      ctx.fillStyle = PAL.wing;                                       // 両わきの羽
+      ell(ctx, -19, -36, 6, 15, 0.15); ctx.fill(); ell(ctx, 19, -36, 6, 15, -0.15); ctx.fill();
+      ctx.fillStyle = PAL.flank; ell(ctx, 0, -14, 18, 7); ctx.fill();
+      ctx.fillStyle = "rgba(60,40,20,0.13)"; ell(ctx, 0, -12, 22, 6); ctx.fill();
+      ctx.restore();
+      bodyPath(); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // 頭（体の手前。つつく時は下へ）
+      const hy = -38 + 24 * k, R = 12.5;
+      ctx.save();
+      ctx.translate(Math.sin(p.yaw) * 2, hy); ctx.rotate(p.tilt);
+      ell(ctx, 0, 0, R, R * 0.92); ctx.fillStyle = PAL.cheek; ctx.fill();
+      ctx.save(); ctx.clip();
+      const cy = -3 + 11 * k;                            // 頭のてっぺんの見える量（つつく時は頭の上がこちらを向く）
+      ctx.fillStyle = PAL.cap;
+      ctx.beginPath(); ctx.moveTo(-R - 1, cy); ctx.bezierCurveTo(-6, cy - 3, 6, cy - 3, R + 1, cy); ctx.lineTo(R + 1, -R - 1); ctx.lineTo(-R - 1, -R - 1); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = tone(PAL.cap, 0.18); ell(ctx, 0, -9 + 6 * k, 6, 2.6 + 2 * k); ctx.fill();
+      ctx.save(); ctx.translate(0, 10 * k);
+      ctx.fillStyle = PAL.black;
+      ell(ctx, -10.8, 3, 2.4, 2.6); ctx.fill(); ell(ctx, 10.8, 3, 2.4, 2.6); ctx.fill();      // ほおの黒い点（両わき）
+      ctx.beginPath(); ctx.moveTo(-3, 3.5); ctx.quadraticCurveTo(0, 2.5, 3, 3.5); ctx.lineTo(2.2, 9.5); ctx.quadraticCurveTo(0, 10.5, -2.2, 9.5); ctx.closePath(); ctx.fill();   // のどの黒
+      ctx.restore();
+      ctx.restore();
+      ell(ctx, 0, 0, R, R * 0.92); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // 目とくちばし（つつく時は下へずれて、目は頭のかげになる）
+      ctx.translate(0, 9 * k);
+      if (k > 0.5) { /* 目は見えない */ } else if (p.blink) {
+        ctx.strokeStyle = PAL.eye; ctx.lineWidth = 1.2; ctx.beginPath();
+        ctx.moveTo(-8.5, -2); ctx.lineTo(-5.5, -2); ctx.moveTo(5.5, -2); ctx.lineTo(8.5, -2); ctx.stroke();
+      } else {
+        ctx.fillStyle = PAL.eye; ell(ctx, -7, -2.2, 1.6, 1.9); ctx.fill(); ell(ctx, 7, -2.2, 1.6, 1.9); ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.9)"; ell(ctx, -6.5, -2.9, 0.5, 0.5); ctx.fill(); ell(ctx, 7.5, -2.9, 0.5, 0.5); ctx.fill();
+      }
+      ctx.fillStyle = PAL.beak;
+      ctx.beginPath(); ctx.moveTo(-3.2, -0.5); ctx.lineTo(3.2, -0.5); ctx.lineTo(0, 6); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.35)"; ell(ctx, -0.8, 0.8, 0.8, 1.6); ctx.fill();
+      ctx.restore();
+    }
+
+    // 後ろ（向こうへ行く）
+    function drawBack(ctx, p, sd, lw) {
+      const k = p.dip;
+      ctx.translate(0, -p.lift);
+      // 足（体のかげ。左右の外に少しだけ見える）
+      if (p.legs !== "fold" && p.legs !== "tuck") {
+        ctx.strokeStyle = PAL.leg; ctx.lineWidth = 2.4; ctx.lineCap = "round";
+        ctx.beginPath(); [-6, 6].forEach(function (x) { ctx.moveTo(x, -12); ctx.lineTo(x * 1.1, -1); }); ctx.stroke();
+      }
+      // 頭（体の向こう。つつく時は体のかげにかくれる）
+      const R = 12.5, hy = -60 + 22 * k;
+      ctx.save();
+      ctx.translate(Math.sin(p.yaw) * 2.5, hy); ctx.rotate(p.tilt);
+      ell(ctx, 0, 0, R, R * 0.92); ctx.fillStyle = PAL.cheek; ctx.fill();
+      ctx.save(); ctx.clip();
+      ctx.fillStyle = PAL.cap;
+      ctx.beginPath(); ctx.moveTo(-6.5, R + 2); ctx.bezierCurveTo(-7, 4, -9, -1, -R - 1, -3); ctx.lineTo(-R - 1, -R - 1); ctx.lineTo(R + 1, -R - 1); ctx.lineTo(R + 1, -3); ctx.bezierCurveTo(9, -1, 7, 4, 6.5, R + 2); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = tone(PAL.cap, 0.15); ell(ctx, 0, -4, 5, 5); ctx.fill();
+      ctx.fillStyle = "rgba(60,40,20,0.15)"; ell(ctx, 0, 9, 10, 4); ctx.fill();
+      ctx.restore();
+      ell(ctx, 0, 0, R, R * 0.92); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      ctx.restore();
+      // 胴（背中のまだら）
+      const bodyPath = function () { ell(ctx, 0, -31, 20, 21); };
+      bodyPath(); ctx.fillStyle = PAL.back; ctx.fill();
+      ctx.save(); bodyPath(); ctx.clip();
+      ctx.fillStyle = tone(PAL.back, 0.12); ell(ctx, 0, -44, 12, 7); ctx.fill();         // 首のうしろの明るさ
+      streaks(ctx, sd + 0.37, -12, 9, -46, -26, 7, 1.45);
+      ctx.restore();
+      bodyPath(); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      if (p.fly) { flapWing(ctx, "back", { f: 6, l: 7, z: 40 }, 1, p.theta, p.pitch, lw); flapWing(ctx, "back", { f: 6, l: -7, z: 40 }, -1, p.theta, p.pitch, lw); }
+      else {
+        // たたんだ羽（左右）
+        [-1, 1].forEach(function (sx) {
+          ctx.save(); ctx.scale(sx, 1);
+          ctx.beginPath(); ctx.moveTo(8, -46); ctx.bezierCurveTo(20, -44, 22, -30, 16, -12); ctx.quadraticCurveTo(9, -22, 7, -34); ctx.closePath();
+          ctx.fillStyle = PAL.wing; ctx.fill();
+          ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.8; ctx.stroke();
+          ctx.fillStyle = PAL.prim; ctx.beginPath(); ctx.moveTo(12, -28); ctx.lineTo(17, -26); ctx.lineTo(15, -12); ctx.closePath(); ctx.fill();
+          ctx.restore();
+        });
+      }
+      // 尾（こちらへのびる）
+      const tipY = 1 - 20 * k;
+      ctx.beginPath(); ctx.moveTo(-5, -17); ctx.lineTo(-10, tipY); ctx.quadraticCurveTo(0, tipY + 3, 10, tipY); ctx.lineTo(5, -17); ctx.closePath();
+      ctx.fillStyle = PAL.tail; ctx.fill();
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      ctx.strokeStyle = tone(PAL.tail, 0.3); ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, -15); ctx.lineTo(0, tipY + 1); ctx.stroke();
+    }
+
+    return {
+      size: { w: 10, h: 5.5 },
+      states: ["idle", "walk", "peck", "hop", "fly"],
+      draw: function (ctx, s) {
+        const p = poseOf(s), sd = s.seed || 0;
+        ctx.save();
+        ctx.scale(MM, MM);
+        const lw = lineMM(ctx);
+        if (s.view === "front") drawFront(ctx, p, sd, lw);
+        else if (s.view === "back") drawBack(ctx, p, sd, lw);
+        else drawSide(ctx, p, sd, lw);
+        ctx.restore();
+      }
+    };
+  })();
+
+  // ------------------------------------------------------------
+  // 動物の絵：ちょうちょ（butterfly）  variant＝"monshiro"（モンシロチョウ）｜"ageha"（アゲハ）
+  //   羽は「付け根から先へ u・前へ v（mm）」の平らな形で描き、羽ばたきの角度で立体に回して画面に写す。
+  //   本物の2倍の大きさ（スズメと同じ物差し）。原点＝体の下（止まっている所）。飛ぶ高さは仕組みの側。
+  // ------------------------------------------------------------
+  ANIMAL_ART.butterfly = (function () {
+    const MM = 2 * 45 * 1.4 / 1600;           // 1mm＝何px（2倍の大きさ）
+    const OL = "rgba(40,30,20,0.55)";
+
+    function lineMM(ctx) {
+      let sc = MM;
+      if (ctx.getTransform) { const m = ctx.getTransform(); sc = Math.sqrt(Math.abs(m.a * m.d - m.b * m.c)) || MM; }
+      return Math.max(0.5, Math.min(1.6, 0.7 / sc));
+    }
+    // ちょうちょは羽が見えるように、本物の斜め見下ろしより少し上から見た形で描く（奥行き 0.7・高さ 0.75）
+    function proj(view, f, l, z) {
+      if (view === "front") return { x: l, y: -z * 0.75 + f * 0.7 };
+      if (view === "back") return { x: -l, y: -z * 0.75 - f * 0.7 };
+      return { x: f, y: -z * 0.75 - l * 0.7 };
+    }
+    function ell(ctx, x, y, rx, ry, rot) { ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot || 0, 0, Math.PI * 2); }
+    function poly(ctx, pts) { ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]); ctx.closePath(); }
+    // 点の並びを、なめらかな曲線でつなぐ（角を丸める）
+    function smooth(ctx, pts) {
+      const n = pts.length;
+      ctx.beginPath();
+      const mid = function (a, b) { return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]; };
+      let m = mid(pts[n - 1], pts[0]);
+      ctx.moveTo(m[0], m[1]);
+      for (let i = 0; i < n; i++) { const q = mid(pts[i], pts[(i + 1) % n]); ctx.quadraticCurveTo(pts[i][0], pts[i][1], q[0], q[1]); }
+      ctx.closePath();
+    }
+
+    // ----- モンシロチョウ -----
+    const MON = {
+      body: 20, bodyW: 2.2, bodyCol: "#3a3836", hair: "rgba(240,240,232,0.75)",
+      fore: [[0, 1.5], [9, 4.2], [20, 4.6], [26.5, 2], [27, -1], [25, -6], [21, -11], [17, -13.5], [9, -11], [2, -5]],
+      hind: [[0, -3], [9, -4.2], [17, -7], [20.5, -12], [18.5, -18], [12, -22], [5, -19.5], [1, -11]],
+      paint: function (ctx, wing, top, sd) {
+        if (wing === "fore") {
+          ctx.fillStyle = top ? "#f8f7f0" : "#f6f3dc"; ctx.fillRect(-2, -20, 34, 30);
+          ctx.fillStyle = top ? "rgba(120,125,120,0.35)" : "rgba(170,170,120,0.25)"; ell(ctx, 1, -2, 7, 6); ctx.fill();   // 付け根の灰色
+          ctx.fillStyle = top ? "#3e3c3a" : "rgba(230,214,120,0.85)";                      // 前羽の先（表＝黒、裏＝黄色っぽい）
+          smooth(ctx, [[17, 5.5], [28, 3], [28, -3], [25.5, -4.5], [23.5, -1], [20, 2.5]]); ctx.fill();
+          ctx.fillStyle = top ? "#3e3c3a" : "rgba(80,78,74,0.55)";                         // 黒い点
+          ell(ctx, 16.5, -5.5, 2.1, 2.3); ctx.fill();
+          if (sd > 0.45) { ell(ctx, 13.5, -10.2, 1.6, 1.7); ctx.fill(); }               // めすは点が2つ
+        } else {
+          ctx.fillStyle = top ? "#f7f6ee" : "#f1ecc8"; ctx.fillRect(-2, -26, 26, 26);
+          ctx.fillStyle = top ? "rgba(120,125,120,0.30)" : "rgba(170,160,90,0.25)"; ell(ctx, 1, -6, 6, 6); ctx.fill();
+          if (top) { ctx.fillStyle = "#4a4846"; ell(ctx, 11.5, -5, 1.3, 1.1); ctx.fill(); }  // 後ろ羽の前のふちの小さな点
+        }
+      }
+    };
+
+    // ----- アゲハ（ナミアゲハ） -----
+    const AGE = {
+      body: 30, bodyW: 3.2, bodyCol: "#26221c", hair: "rgba(240,210,90,0.85)",
+      fore: [[0, 2], [12, 6.5], [30, 8], [44, 6], [48.5, 2.5], [47, -4], [42, -13], [35, -20], [24, -18], [10, -12], [2, -6]],
+      hind: [[0, -4], [14, -6], [27, -11], [34, -19], [34, -27], [31, -31], [31.5, -40], [29.5, -45], [27, -44], [26.5, -34], [19, -35], [10, -32], [5, -27], [3, -18], [0, -10]],
+      paint: function (ctx, wing, top, sd) {
+        const Y = top ? "#f6dc6c" : "#f4e6a6", K = top ? "#26221c" : "#4a4232";
+        if (wing === "fore") {
+          ctx.fillStyle = Y; ctx.fillRect(-2, -24, 54, 36);
+          ctx.fillStyle = K;
+          poly(ctx, [[-2, 4], [14, 9], [12, -16], [-2, -9]]); ctx.fill();                 // 付け根の黒
+          ctx.strokeStyle = Y; ctx.lineWidth = 1.1; ctx.beginPath();                      // 付け根の黄色い筋
+          [[1, 1, 12, 4], [1, -2, 12, 0.5], [1, -5, 12, -3], [1, -8, 12, -7]].forEach(function (q) { ctx.moveTo(q[0], q[1]); ctx.lineTo(q[2], q[3]); });
+          ctx.stroke();
+          ctx.fillStyle = K;
+          [[17, 3.5], [23, 3.2], [29, 2.8]].forEach(function (c) { poly(ctx, [[c[0] - 2, 9], [c[0] + 2, 9], [c[0] + 1.5, c[1] - 3], [c[0] - 1.5, c[1] - 3]]); ctx.fill(); });   // 前のふちの黒い帯
+          // 外のふちの太い黒い帯
+          poly(ctx, [[33, 9], [52, 4], [50, -5], [44, -16], [37, -23], [29, -20], [33, -12], [37, -4], [34, 4]]); ctx.fill();
+          ctx.fillStyle = Y;                                                               // 帯の中の黄色い点
+          [[45, 1, 1.5], [44, -4, 1.4], [42, -9, 1.4], [39, -14, 1.3], [35, -18, 1.2]].forEach(function (c) { ell(ctx, c[0], c[1], c[2] * 1.2, c[2]); ctx.fill(); });
+          ctx.strokeStyle = K; ctx.lineWidth = 0.8; ctx.beginPath();                      // 翅脈
+          [[10, -6, 34, -14], [10, -4, 37, -6], [12, -1, 38, 1]].forEach(function (q) { ctx.moveTo(q[0], q[1]); ctx.lineTo(q[2], q[3]); });
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = Y; ctx.fillRect(-2, -48, 40, 48);
+          ctx.fillStyle = K;
+          poly(ctx, [[-2, -2], [6, -5], [8, -14], [4, -24], [-2, -20]]); ctx.fill();       // 付け根の黒
+          // ふちの黒い帯と尾
+          poly(ctx, [[18, -8], [30, -10], [37, -20], [36, -30], [33, -34], [33, -48], [25, -48], [25, -36], [12, -36], [4, -30], [8, -26], [16, -29], [24, -28], [28, -21], [24, -14]]); ctx.fill();
+          ctx.fillStyle = top ? "#5b88cc" : "#7a96bc";                                     // 青い点
+          [[27, -26], [22, -30], [16, -31.5], [30, -19]].forEach(function (c) { ell(ctx, c[0], c[1], 1.6, 1.3); ctx.fill(); });
+          ctx.fillStyle = Y;                                                               // ふちの黄色い三日月
+          [[33, -16], [34, -25], [21, -34.5], [14, -34]].forEach(function (c) { ell(ctx, c[0], c[1], 1.4, 1); ctx.fill(); });
+          ctx.fillStyle = "#e8803a";                                                       // だいだいの目玉もよう
+          ell(ctx, 8, -30, 2.6, 2.3); ctx.fill();
+          ctx.fillStyle = K; ell(ctx, 8.4, -30.4, 1, 0.9); ctx.fill();
+        }
+      }
+    };
+
+    // 羽を1枚描く
+    function wing(ctx, view, V, which, root, side, theta, pitch, sweep, lw, sd) {
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      // 羽の先の向き（sweep＝前へ少し振る）と、前の向き
+      const cs = Math.cos(sweep), ss = Math.sin(sweep);
+      const S0 = { f: ss, l: side * cs * Math.cos(theta), z: cs * Math.sin(theta) };
+      const S = { f: S0.f * cp - S0.z * sp, l: S0.l, z: S0.f * sp + S0.z * cp };
+      const F0 = { f: cs, l: -side * ss * Math.cos(theta), z: -ss * Math.sin(theta) };
+      const F = { f: F0.f * cp - F0.z * sp, l: F0.l, z: F0.f * sp + F0.z * cp };
+      const o = proj(view, 0, 0, 0), a = proj(view, S.f, S.l, S.z), c = proj(view, F.f, F.l, F.z), r = proj(view, root.f, root.l, root.z);
+      const ax = a.x - o.x, ay = a.y - o.y, cx = c.x - o.x, cy = c.y - o.y;
+      const a0 = proj(view, 0, side, 0), c0 = proj(view, 1, 0, 0);
+      const det0 = (a0.x - o.x) * (c0.y - o.y) - (a0.y - o.y) * (c0.x - o.x), det = ax * cy - ay * cx;
+      const top = det * det0 > 0;                       // 表が見えているか
+      const shape = which === "fore" ? V.fore : V.hind;
+      ctx.save();
+      ctx.transform(ax, ay, cx, cy, r.x, r.y);
+      smooth(ctx, shape);
+      ctx.save(); ctx.clip();
+      V.paint(ctx, which, top, sd);
+      ctx.restore();
+      smooth(ctx, shape);
+      ctx.restore();
+      ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+    }
+
+    // 体（頭・胸・腹）と触角
+    function body(ctx, view, V, pitch, lw) {
+      const cp = Math.cos(pitch), sp = Math.sin(pitch);
+      const P = function (f, z) { return proj(view, f * cp - z * sp, 0, f * sp + z * cp); };
+      const L = V.body, head = P(L * 0.28, 0), tail = P(-L * 0.72, 0);
+      ctx.lineCap = "round";
+      ctx.strokeStyle = OL; ctx.lineWidth = V.bodyW * 2 + lw * 2;
+      ctx.beginPath(); ctx.moveTo(head.x, head.y); ctx.lineTo(tail.x, tail.y); ctx.stroke();
+      ctx.strokeStyle = V.bodyCol; ctx.lineWidth = V.bodyW * 2;
+      ctx.beginPath(); ctx.moveTo(head.x, head.y); ctx.lineTo(tail.x, tail.y); ctx.stroke();
+      ctx.strokeStyle = V.hair; ctx.lineWidth = V.bodyW * 0.7;                // 体の毛・アゲハの黄色い筋
+      const m = P(-L * 0.1, V.bodyW * 0.4), n = P(-L * 0.62, V.bodyW * 0.4);
+      ctx.beginPath(); ctx.moveTo(m.x, m.y); ctx.lineTo(n.x, n.y); ctx.stroke();
+      // 触角（先がふくらむ）
+      ctx.strokeStyle = V.bodyCol; ctx.lineWidth = Math.max(0.6, lw * 0.9);
+      [1, -1].forEach(function (sx) {
+        const b = proj(view, (L * 0.3) * cp, 0, (L * 0.3) * sp);
+        const e = proj(view, (L * 0.3 + L * 0.5) * cp - L * 0.35 * sp, sx * L * 0.22, (L * 0.3 + L * 0.5) * sp + L * 0.35 * cp);
+        ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(e.x, e.y); ctx.stroke();
+        ctx.fillStyle = V.bodyCol; ell(ctx, e.x, e.y, V.bodyW * 0.45, V.bodyW * 0.45); ctx.fill();
+      });
+      ctx.lineCap = "butt";
+    }
+
+    // 状態から羽の角度と体の傾きを決める
+    function poseOf(s) {
+      const ph = s.phase || 0, t = s.t || 0, sd = s.seed || 0;
+      if (s.state === "idle") {                          // とまって、羽を立てて閉じ、ときどきゆっくり開く
+        const o = Math.max(0, Math.sin(t * 0.9 + sd * 6.28));
+        return { theta: (78 - 56 * o * o * o) * Math.PI / 180, lag: 0, pitch: 0.05, sweep: 0.05 };
+      }
+      // flutter（walk も同じ）：羽を大きく打ち下ろす。前羽が先に動き、後ろ羽が少し遅れる
+      const c = Math.cos(Math.PI * 2 * ph);
+      return { theta: (30 + 56 * c) * Math.PI / 180, lag: 0.12, pitch: 0.35 - 0.12 * c, sweep: 0.12 + 0.08 * c };
+    }
+
+    return {
+      size: { w: 8, h: 4.5 },
+      states: ["idle", "walk", "flutter"],
+      draw: function (ctx, s) {
+        const V = s.variant === "ageha" ? AGE : MON, view = s.view || "side", sd = s.seed || 0;
+        const p = poseOf(s);
+        const thH = p.theta + p.lag * (s.state === "idle" ? 0 : -Math.sin(Math.PI * 2 * (s.phase || 0)));   // 後ろ羽の角度
+        ctx.save();
+        ctx.scale(MM, MM);
+        const lw = lineMM(ctx);
+        const zb = V.bodyW + 1;                                       // 体の中心の高さ（原点＝とまっている所）
+        ctx.translate(0, -zb);
+        const rootF = { f: 1, l: V.bodyW * 0.4 }, rootH = { f: -2, l: V.bodyW * 0.4 };
+        const drawSide = function (side) {
+          wing(ctx, view, V, "hind", { f: rootH.f, l: side * rootH.l, z: 0 }, side, thH, p.pitch, -p.sweep * 0.5, lw, sd);
+          wing(ctx, view, V, "fore", { f: rootF.f, l: side * rootF.l, z: 0 }, side, p.theta, p.pitch, p.sweep, lw, sd);
+        };
+        if (view === "side") {                        // 向こう側の羽→体→手前の羽
+          drawSide(1); body(ctx, view, V, p.pitch, lw); drawSide(-1);
+        } else if (view === "front") {
+          drawSide(1); drawSide(-1); body(ctx, view, V, p.pitch, lw);
+        } else {
+          body(ctx, view, V, p.pitch, lw); drawSide(1); drawSide(-1);
+        }
+        ctx.restore();
+      }
+    };
+  })();
+
+  // ------------------------------------------------------------
+  // 動物の絵：柴犬（shiba）と猫（cat）
+  //   形は「絵の決まり」どおり：原点＝足元の中心（地面に触れる所）、上が −y、右向きの横向きが基本。
+  //   物差しは 1マス＝45px（ART_PX）。影・左向きの反転・高さのずらしは仕組みの側で行う。
+  //   足の曲げ方・線の太さ・まばたきなどの部品を2種で共有するため、ひとつの囲みの中で2つを代入する
+  //   （外に新しい名前は作らない）。
+  // ------------------------------------------------------------
+  (function () {
+    const OL = "rgba(40,30,20,0.55)";          // 輪郭の色（COLORS.outline と同じ）
+    const OL_SOFT = "rgba(40,30,20,0.22)";     // 体の中の筋（もも・肩の盛り上がり）の薄い線
+    const TAU = Math.PI * 2;
+
+    // 色を明るく（amt が＋）／暗く（amt が－）する。色は #rrggbb
+    function shade(hex, amt) {
+      const n = parseInt(hex.slice(1), 16);
+      const to = amt < 0 ? 0 : 255;
+      const k = Math.abs(amt);
+      const f = function (v) { return Math.round(v + (to - v) * k); };
+      return "rgb(" + f((n >> 16) & 255) + "," + f((n >> 8) & 255) + "," + f(n & 255) + ")";
+    }
+
+    // 輪郭の太さ：画面で約1px（大きく拡大しているときだけ少し太く）
+    function lineW(ctx) {
+      const m = ctx.getTransform();
+      const sc = Math.max(0.01, Math.hypot(m.a, m.b));
+      return (sc <= 1 ? 0.9 : 0.9 * Math.sqrt(sc)) / sc;
+    }
+
+    // 点の並びを通る、なめらかな線（閉じる／閉じない）
+    function smooth(ctx, pts, closed) {
+      const n = pts.length;
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      const last = closed ? n : n - 1;
+      for (let i = 0; i < last; i++) {
+        const p1 = pts[i], p2 = pts[(i + 1) % n];
+        const p0 = closed || i > 0 ? pts[(i - 1 + n) % n] : p1;
+        const p3 = closed || i + 2 < n ? pts[(i + 2) % n] : p2;
+        ctx.bezierCurveTo(p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
+          p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6, p2[0], p2[1]);
+      }
+      if (closed) ctx.closePath();
+    }
+
+    // 形を塗って輪郭を描く（line が null なら輪郭なし）
+    function shape(ctx, pts, fill, lw, line) {
+      smooth(ctx, pts, true);
+      ctx.fillStyle = fill; ctx.fill();
+      if (line !== null) { ctx.strokeStyle = line || OL; ctx.lineWidth = lw; ctx.stroke(); }
+    }
+
+    // だ円を塗って輪郭を描く
+    function oval(ctx, x, y, rx, ry, rot, fill, lw, line) {
+      ctx.beginPath(); ctx.ellipse(x, y, rx, ry, rot, 0, TAU);
+      ctx.fillStyle = fill; ctx.fill();
+      if (line !== null) { ctx.strokeStyle = line || OL; ctx.lineWidth = lw; ctx.stroke(); }
+    }
+
+    // 形の中だけに模様を描く（clip）。paint(ctx) の中で塗る
+    function inside(ctx, pts, paint) {
+      ctx.save(); smooth(ctx, pts, true); ctx.clip(); paint(ctx); ctx.restore();
+    }
+
+    // 太さが変わる線（足・しっぽ）を、ひとつの形として塗る。ws＝点ごとの太さ
+    function limb(ctx, pts, ws, fill, lw, line) {
+      const L = [], R = [];
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i], q = pts[Math.min(i + 1, pts.length - 1)], o = pts[Math.max(i - 1, 0)];
+        let tx = q[0] - o[0], ty = q[1] - o[1];
+        const len = Math.hypot(tx, ty) || 1;
+        tx /= len; ty /= len;
+        const w = ws[i] / 2;
+        L.push([p[0] - ty * w, p[1] + tx * w]);
+        R.push([p[0] + ty * w, p[1] - tx * w]);
+      }
+      shape(ctx, L.concat(R.reverse()), fill, lw, line);
+    }
+
+    // 2つの骨の関節の位置（a から b へ、長さ l1・l2）。bend＝+1 で関節が前（＋x）へ出る
+    function ik(a, b, l1, l2, bend) {
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const d = Math.min(Math.max(Math.hypot(dx, dy), Math.abs(l1 - l2) + 0.01), l1 + l2 - 0.01);
+      const ang = Math.atan2(dy, dx) - bend * Math.acos(Math.max(-1, Math.min(1, (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d))));
+      return [a[0] + Math.cos(ang) * l1, a[1] + Math.sin(ang) * l1];
+    }
+
+    // 足の運び。p＝周期の中の位置、swing＝足を上げている割合、stride＝前後のふり幅
+    //   x＝休みの位置からの前後のずれ、lift＝上げている高さの割合（0〜1）
+    function gait(p, swing, stride) {
+      p = ((p % 1) + 1) % 1;
+      if (p < swing) {
+        const u = p / swing;
+        return { x: -stride + 2 * stride * u * u * (3 - 2 * u), lift: Math.sin(Math.PI * u) };
+      }
+      const u = (p - swing) / (1 - swing);
+      return { x: stride - 2 * stride * u, lift: 0 };
+    }
+
+    // まばたき（個体ごとにずらす）
+    function blinking(s) { return ((s.t + s.seed * 7.3) % 3.9) < 0.13; }
+
+    // 0〜1 の決まった乱数（個体の seed から、模様の位置などを作る）
+    function rnd(seed, k) {
+      const v = Math.sin((seed * 917.13 + k * 71.7) * 12.9898) * 43758.5453;
+      return v - Math.floor(v);
+    }
+
+    // s の足りない値を補う（phase・t・seed が無くても描けるように）
+    function norm(s) {
+      return { state: s.state || "idle", phase: s.phase || 0, t: s.t || 0, view: s.view || "side", seed: s.seed || 0, variant: s.variant };
+    }
+
+    // 体の向きの変換（傾き rot を pivot のまわりにかけ、(bx,by) ずらす）
+    function frame(rot, pivot, bx, by) {
+      const c = Math.cos(rot), s = Math.sin(rot);
+      return {
+        rot: rot,
+        pt: function (p) {
+          const x = p[0] - pivot[0], y = p[1] - pivot[1];
+          return [c * x - s * y + pivot[0] + bx, s * x + c * y + pivot[1] + by];
+        },
+        apply: function (ctx) {
+          ctx.translate(pivot[0] + bx, pivot[1] + by); ctx.rotate(rot); ctx.translate(-pivot[0], -pivot[1]);
+        }
+      };
+    }
+
+    // ------------------------------------------------------------
+    // 横向きの4本足の動物（犬・猫で共通の組み立て）
+    //   Q＝種類ごとの寸法と描き方、s＝絵の決まりの s
+    // ------------------------------------------------------------
+    function sidePose(Q, s) {
+      const st = s.state, ph = s.phase || 0, t = s.t || 0;
+      const P = { rot: 0, bx: 0, by: 0, legs: null, headTilt: 0, headDy: 0, sit: false, earBack: 0, mouth: 0 };
+      let g = null;
+      if (st === "walk") g = Q.walk;
+      if (st === "run") g = Q.run;
+      if (g) {
+        // 足の順番：歩く＝左後→左前→右後→右前（横から見た4拍子）。走る＝後ろ2本→前2本（ギャロップ）
+        const off = st === "run" ? { nH: 0, fH: 0.1, nF: 0.48, fF: 0.6 } : { nH: 0, nF: 0.25, fH: 0.5, fF: 0.75 };
+        P.legs = {};
+        Object.keys(off).forEach(function (k) { P.legs[k] = gait(ph + off[k], g.swing, g.stride); });
+        if (st === "run") {
+          P.rot = Math.sin(ph * TAU) * g.pitch;                       // 走るときは体が前後にゆれる
+          P.by = -Math.abs(Math.sin(ph * TAU + 0.6)) * g.bob;
+          P.headDy = Math.sin(ph * TAU + 1.2) * 0.4;
+          P.earBack = Q.runEarBack;
+          P.mouth = Q.runMouth;
+        } else {
+          P.by = -Math.abs(Math.sin(ph * TAU * 2)) * g.bob;            // 歩くときは1歩ごとに少し上下
+          P.headDy = Math.sin(ph * TAU * 2 + 0.8) * g.bob * 0.6;
+        }
+      } else {
+        P.legs = { nH: { x: 0, lift: 0 }, fH: { x: 0.25, lift: 0 }, nF: { x: 0, lift: 0 }, fF: { x: -0.25, lift: 0 } };
+        P.by = Math.sin(t * 1.7 + s.seed * 5) * 0.12;                 // 息で少し上下
+      }
+      if (st === "sit" || st === "groom") {
+        P.sit = true;
+        P.rot = -Q.sitRot;
+      }
+      return P;
+    }
+
+    // 横向きの4本足を描く。parts＝種類ごとの描き方（body / head / tail / pattern など）
+    function drawSide(ctx, Q, s, parts) {
+      const lw = lineW(ctx);
+      const P = sidePose(Q, s);
+      const F = P.sit ? frame(P.rot, Q.sitPivot, Q.sitShift[0], Q.sitShift[1]) : frame(P.rot, Q.center, 0, P.by);
+
+      // 足のふりの角度（体の中の見えない支点 pv から見た、足先の向きの、休みの位置からのずれ。前へ出ると＋）
+      const swingAng = function (pv, paw, rest) {
+        return Math.atan2(paw[0] - pv[0], paw[1] - pv[1]) - Math.atan2(rest[0] - pv[0], rest[1] - pv[1]);
+      };
+      // 支点 pv から v だけ離れた点を、ふりの角度 th だけ回した位置
+      const swingPt = function (pv, v, th) {
+        const c = Math.cos(th), n = Math.sin(th);
+        return [pv[0] + v[0] * c + v[1] * n, pv[1] - v[0] * n + v[1] * c];
+      };
+      // 1本の足を組み立てる（体の上の付け根 → 地面の足先）
+      // 確かめ後の手直し：Q.swingU があるときは、足の付け根とひじ（後ろ足は、かかとの向き）も、体の中の見えない支点
+      // （付け根の swingU px 上。前＝肩、後ろ＝腰）のまわりに足のふりに合わせて回す（本物のように足全体が前後にふれ、大きな歩幅でも足が伸びきらない）
+      const frontLeg = function (lg, far) {
+        let top = F.pt(far ? [Q.frontTop[0] - 0.6, Q.frontTop[1] + 0.3] : Q.frontTop);
+        let elbow = [top[0] + Q.elbow[0], top[1] + Q.elbow[1]];
+        const lift = lg.lift * Q.liftF;
+        const paw = [Q.frontX + lg.x + (far ? 0.5 : 0) - lg.lift * 0.6, (far ? -Q.farUp : 0) - lift];
+        if (Q.swingU) {
+          const pv = [top[0], top[1] - Q.swingU[0]];
+          const th = swingAng(pv, paw, [Q.frontX + (far ? 0.5 : 0), far ? -Q.farUp : 0]);
+          top = swingPt(pv, [0, Q.swingU[0]], th);
+          elbow = swingPt(pv, [Q.elbow[0], Q.swingU[0] + Q.elbow[1]], th);
+        }
+        const wrist = ik(elbow, paw, Q.fl1, Q.fl2, 1);
+        return [top, elbow, wrist, paw];
+      };
+      const hindLeg = function (lg, far) {
+        let top = F.pt(far ? [Q.hindTop[0] + 0.5, Q.hindTop[1] + 0.3] : Q.hindTop);
+        const lift = lg.lift * Q.liftH;
+        const paw = [Q.hindX + lg.x + (far ? 0.5 : 0), (far ? -Q.farUp : 0) - lift];
+        let meta = Q.meta;
+        if (Q.swingU) {
+          const pv = [top[0], top[1] - Q.swingU[1]];
+          const th = swingAng(pv, paw, [Q.hindX + (far ? 0.5 : 0), far ? -Q.farUp : 0]);
+          top = swingPt(pv, [0, Q.swingU[1]], th);
+          meta = swingPt([0, 0], Q.meta, th);
+        }
+        const hock = [paw[0] + meta[0] + lg.lift * 0.9, paw[1] + meta[1] + lg.lift * 0.4];
+        const stifle = ik(top, hock, Q.hl1, Q.hl2, 1);
+        return [top, stifle, hock, paw];
+      };
+      const paintLeg = function (pts, far, hind) {
+        const col = far ? Q.c.farFur : Q.c.legFur;
+        limb(ctx, pts, hind ? Q.hindW : Q.frontW, col, lw);
+        if (parts.leg) parts.leg(ctx, pts, far, hind, lw, s);
+        const p = pts[pts.length - 1];
+        oval(ctx, p[0] + 0.35, p[1] - Q.pawR * 0.5, Q.pawR * 1.25, Q.pawR * 0.62, 0, far ? Q.c.farPaw : Q.c.paw, lw);
+      };
+
+      if (!P.sit) {
+        // 立っている・歩く・走る
+        const L = P.legs;
+        if (parts.tailBehind) parts.tail(ctx, s, F, P, lw);
+        paintLeg(hindLeg(L.fH, true), true, true);
+        paintLeg(frontLeg(L.fF, true), true, false);
+        const nh = hindLeg(L.nH, false), nf = frontLeg(L.nF, false);
+        paintLeg(nh, false, true);
+        paintLeg(nf, false, false);
+        ctx.save(); F.apply(ctx);
+        parts.body(ctx, s, P, lw);
+        // もも・肩の盛り上がり（薄い筋だけ。足の振りに合わせて少し回す）
+        const ha = Math.atan2(nh[1][1] - nh[0][1], nh[1][0] - nh[0][0]) - Q.thighRest - F.rot;
+        ctx.strokeStyle = OL_SOFT; ctx.lineWidth = lw;
+        ctx.beginPath(); ctx.ellipse(Q.thigh[0], Q.thigh[1], Q.thigh[2], Q.thigh[3], Q.thigh[4] + ha * 0.6, -1.25, 1.2); ctx.stroke();
+        const fa = Math.atan2(nf[2][1] - nf[1][1], nf[2][0] - nf[1][0]) - Math.PI / 2 - F.rot;
+        ctx.beginPath(); ctx.ellipse(Q.shoulder[0], Q.shoulder[1], Q.shoulder[2], Q.shoulder[3], Q.shoulder[4] + fa * 0.5, 2.4, 3.6); ctx.stroke();
+        ctx.restore();
+      } else {
+        // 座る（体を後ろへ傾けて、おしりを地面に下ろす）
+        if (parts.tailBehind) parts.tail(ctx, s, F, P, lw);
+        const fl = function (far) {
+          const top = F.pt(far ? [Q.frontTop[0] - 0.6, Q.frontTop[1] + 0.3] : Q.frontTop);
+          const paw = [top[0] + Q.sitFrontX + (far ? 0.6 : 0), far ? -Q.farUp : 0];   // 前足はほぼまっすぐ下へ
+          const mid = ik(top, paw, Q.fl1 + 2.2, Q.fl2 + 1.4, 1);
+          return [top, mid, [paw[0] - 0.2, paw[1] - Q.pawR * 1.4], paw];
+        };
+        // 奥の後ろ足の先
+        oval(ctx, Q.sitHindPaw[0] + 0.8, Q.sitHindPaw[1] - Q.farUp - Q.pawR * 0.5, Q.pawR * 1.5, Q.pawR * 0.62, 0, Q.c.farPaw, lw);
+        paintLeg(fl(true), true, false);
+        let groomPaw = null;
+        if (s.state === "groom" && parts.groomPaw) groomPaw = parts.groomPaw(s, F);
+        ctx.save(); F.apply(ctx);
+        parts.body(ctx, s, P, lw);
+        ctx.restore();
+        // 手前の後ろ足（たたんだもも＋地面に寝た足先）
+        const hp = Q.sitHindPaw;
+        limb(ctx, [[hp[0] - Q.sitHock, hp[1] - Q.pawR * 0.9], [hp[0], hp[1] - Q.pawR * 0.6]], [Q.hindW[2] + 0.3, Q.hindW[3]], Q.c.legFur, lw);
+        oval(ctx, hp[0] + 0.3, hp[1] - Q.pawR * 0.5, Q.pawR * 1.5, Q.pawR * 0.62, 0, Q.c.paw, lw);
+        const th = F.pt(Q.sitThigh);
+        oval(ctx, th[0], th[1], Q.thigh[2] * 1.12, Q.thigh[3] * 0.95, -0.35, parts.thighFill || Q.c.fur, lw);
+        if (parts.sitThigh) parts.sitThigh(ctx, th, s, lw);
+        if (groomPaw) {
+          paintLeg(groomPaw, false, false);
+        } else {
+          paintLeg(fl(false), false, false);
+        }
+        if (parts.sitFront) parts.sitFront(ctx, s, F, P, lw);
+      }
+
+      // 頭（体が傾いても、頭はほぼ水平に保つ）
+      const hp = F.pt(Q.headPivot);
+      if (P.sit) { hp[0] += Q.sitHead[0]; hp[1] += Q.sitHead[1]; }     // 座ると首をすくめる
+      ctx.save();
+      ctx.translate(hp[0], hp[1] + P.headDy);
+      ctx.rotate(parts.headTilt ? parts.headTilt(s, P) : 0);
+      ctx.scale(Q.headScale, Q.headScale);
+      parts.head(ctx, s, P, lw);
+      ctx.restore();
+      if (!parts.tailBehind) parts.tail(ctx, s, F, P, lw);
+      if (groomOver(s, parts)) parts.groomOver(ctx, s, F, lw);
+    }
+    function groomOver(s, parts) { return s.state === "groom" && parts.groomOver; }
+
+    // ------------------------------------------------------------
+    // 柴犬（赤毛・裏白・巻き尾・立ち耳）
+    //   肩の高さ 約15px（0.33マス）
+    // ------------------------------------------------------------
+    const SH_C = {
+      fur: "#d98a4b", furTop: "#e5a064", furBack: "#c47538", legFur: "#d78a4c",
+      farFur: "#b06c39", white: "#fbf2e4", whiteShade: "#ecdcc5",
+      paw: "#f6e9d6", farPaw: "#d9c6ab", nose: "#2a201b", eye: "#26170e",
+      innerEar: "#f1d2b4", tongue: "#e2707a", mouth: "#4a2a22"
+    };
+    const SH = {
+      c: SH_C,
+      center: [0, -11.5],
+      frontTop: [5.0, -10.4], elbow: [-0.4, 2.9], fl1: 4.3, fl2: 3.5, frontX: 5.3,
+      hindTop: [-6.0, -11.4], hl1: 4.7, hl2: 4.5, meta: [-0.7, -3.3], hindX: -6.6,
+      frontW: [3.0, 2.4, 1.8, 1.5], hindW: [3.8, 2.6, 1.75, 1.5], pawR: 1.0,
+      farUp: 0.45, liftF: 1.7, liftH: 1.5,
+      thigh: [-6.4, -11.0, 3.3, 3.9, 0.25], thighRest: Math.atan2(4, 1.2),
+      shoulder: [5.0, -11.5, 2.4, 3.3, -0.2],
+      headPivot: [9.5, -17.0],
+      // 確かめ後の手直し：歩幅を本物に近づけた（歩く 2.3→3.6・走る 4.4→5.0、走るときは足が地面を離れている時間を長く 0.5→0.6）。
+      // 1周期で進む長さ＝2×stride÷(1−swing)＝歩く 11.6px・走る 25px（ANIMAL_KIND の stride・runStride と合わせる）
+      walk: { stride: 3.6, swing: 0.38, bob: 0.35 },
+      run: { stride: 5.0, swing: 0.6, bob: 1.1, pitch: 0.07 },
+      swingU: [4.0, 3.0],              // 足のふりの支点（前＝肩、後ろ＝腰）が、足の付け根の何 px 上にあるか
+      runEarBack: 0.6, runMouth: 1,
+      // 座る：おしりの下を軸に体を起こす
+      sitRot: 0.62, sitPivot: [-7.6, -9.4], sitShift: [2.6, 7.2],
+      sitFrontX: 0.5, sitHindPaw: [-0.6, 0], sitHock: 3.6, sitThigh: [-5.6, -11.2], sitHead: [0, 0], headScale: 1.08
+    };
+    // 胴（首まで含めた形。首の上は頭がおおう）
+    const SH_BODY = [[3.0, -15.4], [-1.5, -14.9], [-6.0, -15.1], [-8.9, -13.7], [-9.7, -11.1], [-8.7, -8.6],
+      [-5.6, -9.0], [-1.0, -8.7], [3.0, -7.7], [6.6, -8.6], [8.6, -11.4], [10.2, -14.0], [11.0, -16.0],
+      [8.6, -18.6], [5.0, -17.4]];
+    const SH_BELLY = [[8.8, -12.6], [7.8, -8.2], [3.0, -7.2], [-1.0, -8.3], [-5.9, -8.5], [-6.2, -9.7],
+      [-1.0, -9.9], [3.2, -9.5], [6.0, -10.7], [7.2, -13.6]];
+    const SH_THROAT = [[10.9, -17.6], [11.2, -15.0], [8.6, -11.4], [7.0, -12.0], [8.2, -14.6], [9.4, -17.4]];
+    const SH_HEAD = [[-2.5, 0.3], [-1.9, -2.3], [0.4, -3.0], [2.0, -2.3], [3.9, -1.6], [4.9, -1.0],
+      [5.0, -0.1], [4.1, 0.8], [2.5, 1.6], [0.3, 2.4], [-1.8, 1.9]];
+    const SH_CHEEK = [[0.5, 0.1], [2.0, -0.9], [4.0, -0.9], [5.2, -0.2], [4.2, 1.0], [2.5, 1.8], [0.3, 2.7], [-1.2, 1.6]];
+
+    // 胴の塗り（上が明るく、下へ少し濃く）
+    function furGrad(ctx, y0, y1, top, mid) {
+      const g = ctx.createLinearGradient(0, y0, 0, y1);
+      g.addColorStop(0, top); g.addColorStop(1, mid);
+      return g;
+    }
+
+    // 柴犬の耳（横向き）。back＝後ろへ倒す量（0〜1）
+    function shibaEarSide(ctx, far, back, twitch, lw) {
+      ctx.save();
+      ctx.translate(far ? -1.2 : 0, far ? -2.2 : -2.5);
+      ctx.rotate(-back * 0.7 + twitch);
+      if (far) {
+        shape(ctx, [[-0.9, 0.4], [-0.7, -3.5], [0.9, 0.0]], SH_C.furBack, lw);
+      } else {
+        shape(ctx, [[-1.1, 0.2], [0.0, -3.9], [1.1, -0.2]], SH_C.fur, lw);
+        shape(ctx, [[-0.5, -0.1], [-0.05, -2.7], [0.55, -0.25]], SH_C.innerEar, lw, null);
+      }
+      ctx.restore();
+    }
+
+    // 柴犬の口（開ける＝はぁはぁ）
+    function shibaMouthSide(ctx, open, lw) {
+      if (open > 0) {
+        shape(ctx, [[4.6, 0.5], [2.7, 0.9], [2.3, 1.2], [3.1, 1.9], [4.2, 1.3]], SH_C.mouth, lw);
+        shape(ctx, [[3.0, 1.3], [2.6, 2.5], [3.2, 2.9], [3.7, 2.1], [3.8, 1.3]], SH_C.tongue, lw * 0.8);
+      } else {
+        ctx.beginPath(); ctx.moveTo(4.6, 0.45); ctx.quadraticCurveTo(3.7, 0.95, 2.8, 0.9);
+        ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.8; ctx.stroke();
+      }
+    }
+
+    // 柴犬の巻いたしっぽ（横向き）。w＝振る量（−1〜1）
+    function shibaTailSide(ctx, base, w, lw) {
+      ctx.save();
+      ctx.translate(base[0], base[1]);
+      ctx.rotate(w * 0.3);
+      ctx.scale(1 - Math.abs(w) * 0.28, 1);
+      const curl = [[0.4, 0.6], [-0.9, -1.4], [-0.7, -3.5], [0.9, -4.6], [2.7, -4.1], [3.2, -2.5], [2.4, -1.1]];
+      // 外側（毛のふくらみ）→ 内側の白（裏白）
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      oval(ctx, 1.1, -2.5, 1.5, 1.7, 0, SH_C.furBack, lw, null);       // 巻きの内側（すき間を埋める）
+      smooth(ctx, curl, false); ctx.strokeStyle = OL; ctx.lineWidth = 2.7 + lw * 2; ctx.stroke();
+      smooth(ctx, curl, false); ctx.strokeStyle = SH_C.fur; ctx.lineWidth = 2.7; ctx.stroke();
+      smooth(ctx, [[0.0, -1.5], [0.1, -3.2], [1.2, -3.8], [2.4, -3.4]], false);
+      ctx.strokeStyle = "rgba(251,242,228,0.7)"; ctx.lineWidth = 0.6; ctx.stroke();
+      smooth(ctx, [[-1.3, -1.8], [-1.0, -3.9], [0.8, -5.2]], false);
+      ctx.strokeStyle = "rgba(150,80,30,0.45)"; ctx.lineWidth = 0.7; ctx.stroke();     // 背の濃い毛先
+      ctx.lineCap = "butt"; ctx.lineJoin = "miter";
+      ctx.restore();
+    }
+
+    // しっぽを振る量（wag は速く大きく、ふだんはときどき小さく）
+    function shibaWag(s) {
+      if (s.state === "wag") return Math.sin(s.t * TAU * 3.2);
+      if (s.state === "run") return Math.sin(s.phase * TAU) * 0.3;
+      return Math.sin(s.t * 1.3 + s.seed * 9) * 0.12;
+    }
+
+    // 首をかしげる・耳を動かす（idle）
+    function shibaIdle(s) {
+      const t = s.t + s.seed * 11;
+      const cyc = t % 6.5;
+      const tilt = cyc < 2.2 ? Math.sin(cyc / 2.2 * Math.PI) * 0.22 * (rnd(s.seed, Math.floor(t / 6.5)) < 0.5 ? 1 : -1) : 0;
+      const tw = (t % 4.3) < 0.18 ? Math.sin((t % 4.3) / 0.18 * Math.PI) * 0.25 : 0;
+      return { tilt: tilt, twitch: tw };
+    }
+
+    const shibaSideParts = {
+      tailBehind: false,
+      body: function (ctx, s, P, lw) {
+        shape(ctx, SH_BODY, furGrad(ctx, -15.5, -8, SH_C.furTop, SH_C.fur), lw);
+        inside(ctx, SH_BODY, function (c) {
+          shape(c, SH_BELLY, SH_C.white, lw, null);
+          shape(c, SH_THROAT, SH_C.white, lw, null);
+          // 首まわりのふさふさの毛
+          c.strokeStyle = "rgba(150,80,30,0.25)"; c.lineWidth = 0.35;
+          for (let i = 0; i < 3; i++) {
+            c.beginPath(); c.moveTo(6.6 + i * 0.9, -15.6 + i * 0.5); c.lineTo(6.0 + i * 0.9, -14.4 + i * 0.5); c.stroke();
+          }
+          // 背の濃い毛（胡麻のようにうっすら）
+          smooth(c, [[3.0, -15.6], [-1.5, -15.1], [-6.0, -15.3], [-8.9, -13.9]], false);
+          c.strokeStyle = "rgba(160,85,35,0.35)"; c.lineWidth = 1.3; c.stroke();
+          // 毛並みの短い線
+          c.strokeStyle = "rgba(150,80,30,0.25)"; c.lineWidth = 0.35;
+          for (let i = 0; i < 5; i++) {
+            const x = 1.5 - i * 2.1;
+            c.beginPath(); c.moveTo(x, -12.4); c.lineTo(x - 0.9, -11.4); c.stroke();
+          }
+        });
+        smooth(ctx, SH_BODY, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      },
+      headTilt: function (s, P) {
+        if (s.state === "idle" || s.state === "sit") return shibaIdle(s).tilt * 0.6;
+        if (s.state === "run") return 0.12;
+        return 0;
+      },
+      head: function (ctx, s, P, lw) {
+        const id = shibaIdle(s);
+        shibaEarSide(ctx, true, P.earBack, 0, lw);
+        shape(ctx, SH_HEAD, SH_C.fur, lw);
+        inside(ctx, SH_HEAD, function (c) {
+          shape(c, SH_CHEEK, SH_C.white, lw, null);
+          oval(c, 1.7, -2.0, 0.5, 0.28, -0.2, "rgba(255,245,230,0.75)", lw, null);   // 目の上の白い毛
+        });
+        smooth(ctx, SH_HEAD, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+        // 鼻・目・口
+        oval(ctx, 4.8, -0.6, 0.6, 0.45, 0, SH_C.nose, lw, null);
+        oval(ctx, 4.9, -0.78, 0.18, 0.1, 0, "rgba(255,255,255,0.55)", lw, null);
+        if (blinking(s)) {
+          ctx.beginPath(); ctx.moveTo(1.1, -1.2); ctx.lineTo(2.1, -1.25);
+          ctx.strokeStyle = SH_C.eye; ctx.lineWidth = lw * 0.9; ctx.stroke();
+        } else {
+          oval(ctx, 1.6, -1.25, 0.55, 0.4, -0.15, SH_C.eye, lw, null);
+          oval(ctx, 1.75, -1.38, 0.16, 0.16, 0, "#ffffff", lw, null);
+        }
+        shibaMouthSide(ctx, P.mouth || (s.state === "wag" ? 1 : 0), lw);
+        ctx.save(); ctx.translate(0, 0);
+        shibaEarSide(ctx, false, P.earBack, id.twitch, lw);
+        ctx.restore();
+      },
+      tail: function (ctx, s, F, P, lw) {
+        shibaTailSide(ctx, F.pt([-7.8, -14.2]), shibaWag(s), lw);
+      },
+      sitThigh: function (ctx, th, s, lw) {
+        // たたんだももの内側の白
+        oval(ctx, th[0] + 1.6, th[1] + 2.2, 1.4, 0.9, -0.3, "rgba(251,242,228,0.9)", lw, null);
+      }
+    };
+
+    // ---- 柴犬：正面と後ろ ----
+    // 正面・後ろの足の上げ下げ（横の歩き方と同じ順番）
+    function frontBackLegs(s, g) {
+      const st = s.state, ph = s.phase || 0;
+      const res = { nH: 0, fH: 0, nF: 0, fF: 0, sway: 0, bob: 0 };
+      if (st === "walk" || st === "run") {
+        const off = st === "run" ? { nH: 0, fH: 0.1, nF: 0.48, fF: 0.6 } : { nH: 0, nF: 0.25, fH: 0.5, fF: 0.75 };
+        Object.keys(off).forEach(function (k) { res[k] = gait(ph + off[k], g.swing, 1).lift; });
+        res.sway = st === "run" ? 0 : Math.sin(ph * TAU) * 0.3;
+        res.bob = st === "run" ? -Math.abs(Math.sin(ph * TAU + 0.6)) * g.bob : -Math.abs(Math.sin(ph * TAU * 2)) * g.bob;
+      } else {
+        res.bob = Math.sin((s.t || 0) * 1.7 + s.seed * 5) * 0.12;
+      }
+      return res;
+    }
+
+    // 正面・後ろ向きの1本の足（上 top から足先 y まで、まっすぐ下）
+    function straightLeg(ctx, x, top, footY, lift, w0, w1, fill, paw, pawR, lw, foreshort) {
+      const fy = footY - lift;
+      const kneeY = top + (fy - top) * 0.55;
+      limb(ctx, [[x, top], [x + 0.05, kneeY], [x, fy - pawR * 0.6]], [w0, (w0 + w1) / 2, w1], fill, lw);
+      oval(ctx, x, fy - pawR * 0.45, pawR * (foreshort ? 0.9 : 1.0), pawR * 0.6, 0, paw, lw);
+    }
+
+    function shibaFace(ctx, s, P, lw, back) {
+      const id = shibaIdle(s);
+      const eb = P.earBack || 0;
+      // 耳（左右）
+      [-1, 1].forEach(function (d) {
+        ctx.save();
+        ctx.translate(d * 1.8, -2.2);
+        ctx.rotate(d * (0.22 + eb * 0.5) + (d > 0 ? id.twitch : 0));
+        shape(ctx, [[-1.0, 0.3], [0.0 + d * 0.15, -3.6 + eb * 0.8], [1.0, 0.3]], back ? SH_C.furBack : SH_C.fur, lw);
+        if (!back) shape(ctx, [[-0.5, 0.1], [0.0 + d * 0.1, -2.5 + eb * 0.6], [0.5, 0.1]], SH_C.innerEar, lw, null);
+        ctx.restore();
+      });
+      const head = [[-3.0, 0.4], [-2.8, -1.6], [-1.6, -2.8], [0, -3.0], [1.6, -2.8], [2.8, -1.6], [3.0, 0.4], [2.2, 2.0], [0, 2.7], [-2.2, 2.0]];
+      shape(ctx, head, back ? furGrad(ctx, -3, 2.6, SH_C.furTop, SH_C.furBack) : SH_C.fur, lw);
+      if (back) {
+        // 後頭部の毛の流れ
+        ctx.strokeStyle = "rgba(150,80,30,0.3)"; ctx.lineWidth = 0.35;
+        ctx.beginPath(); ctx.moveTo(0, -2.6); ctx.lineTo(0, 1.6); ctx.stroke();
+        return;
+      }
+      inside(ctx, head, function (c) {
+        shape(c, [[-3.2, 0.3], [-1.5, -0.4], [-0.5, -1.4], [0, -1.1], [0.5, -1.4], [1.5, -0.4], [3.2, 0.3], [2.4, 2.4], [0, 3.0], [-2.4, 2.4]], SH_C.white, lw, null);
+        oval(c, -1.4, -1.9, 0.45, 0.25, 0.2, "rgba(255,245,230,0.75)", lw, null);   // 目の上の白い毛
+        oval(c, 1.4, -1.9, 0.45, 0.25, -0.2, "rgba(255,245,230,0.75)", lw, null);
+      });
+      smooth(ctx, head, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      // 目
+      [-1, 1].forEach(function (d) {
+        if (blinking(s)) {
+          ctx.beginPath(); ctx.moveTo(d * 0.9, -1.0); ctx.lineTo(d * 1.85, -1.15);
+          ctx.strokeStyle = SH_C.eye; ctx.lineWidth = lw * 0.9; ctx.stroke();
+        } else {
+          oval(ctx, d * 1.35, -1.05, 0.5, 0.37, d * 0.18, SH_C.eye, lw, null);
+          oval(ctx, d * 1.35 + 0.14, -1.18, 0.14, 0.14, 0, "#ffffff", lw, null);
+        }
+      });
+      // 鼻すじ・鼻・口
+      oval(ctx, 0, 0.75, 1.45, 1.1, 0, "rgba(255,248,238,0.9)", lw, null);
+      oval(ctx, 0, 0.25, 0.68, 0.46, 0, SH_C.nose, lw, null);
+      oval(ctx, -0.15, 0.1, 0.2, 0.1, 0, "rgba(255,255,255,0.5)", lw, null);
+      if (P.mouth || s.state === "wag") {
+        shape(ctx, [[-0.9, 1.1], [0.9, 1.1], [0.5, 1.9], [-0.5, 1.9]], SH_C.mouth, lw * 0.8);
+        shape(ctx, [[-0.45, 1.4], [0.45, 1.4], [0.4, 2.5], [0, 2.8], [-0.4, 2.5]], SH_C.tongue, lw * 0.7);
+      } else {
+        ctx.beginPath(); ctx.moveTo(0, 0.7); ctx.lineTo(0, 1.15);
+        ctx.moveTo(-0.75, 1.3); ctx.quadraticCurveTo(0, 1.6, 0.75, 1.3);
+        ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.7; ctx.stroke();
+      }
+    }
+
+    // 巻いたしっぽを上から見た形（背中にのった輪）
+    function shibaCurlTop(ctx, x, y, rx, ry, w, lw) {
+      ctx.save(); ctx.translate(x, y); ctx.rotate(w * 0.25);
+      oval(ctx, 0, 0, rx, ry, 0, SH_C.fur, lw);
+      oval(ctx, 0.15 * rx, 0.05, rx * 0.45, ry * 0.42, 0, SH_C.white, lw, OL_SOFT);
+      ctx.strokeStyle = "rgba(150,80,30,0.4)"; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.ellipse(0, 0, rx * 0.8, ry * 0.8, 0, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+      ctx.restore();
+    }
+
+    // 点の並びを上下にずらす
+    function lift2(pts, dy) { return pts.map(function (p) { return [p[0], p[1] + dy]; }); }
+
+    // 正面（こちらへ向かう）。少し上から見下ろすので、奥にある背中・後ろ足は上にずれて見える
+    function drawShibaFront(ctx, s, lw) {
+      const lg = frontBackLegs(s, s.state === "run" ? SH.run : SH.walk);
+      const sit = s.state === "sit";
+      const lift = s.state === "run" ? 2.6 : 1.6;
+      const P = { earBack: s.state === "run" ? 0.6 : 0, mouth: s.state === "run" ? 1 : 0 };
+      const b = lg.bob, w = shibaWag(s);
+      ctx.save();
+      ctx.translate(lg.sway, 0);
+      if (!sit) {
+        // 奥：後ろ足・背中・巻いたしっぽ
+        straightLeg(ctx, -2.5, -10.0 + b, -4.4, lg.fH * lift * 0.7, 2.4, 1.5, SH_C.farFur, SH_C.farPaw, 0.85, lw, true);
+        straightLeg(ctx, 2.5, -10.0 + b, -4.4, lg.nH * lift * 0.7, 2.4, 1.5, SH_C.farFur, SH_C.farPaw, 0.85, lw, true);
+        shibaCurlTop(ctx, 2.2 + w * 1.2, -19.0 + b, 2.0, 1.5, w, lw);
+        shape(ctx, lift2([[-4.7, -12.0], [-4.5, -15.6], [-3.0, -17.8], [0, -18.4], [3.0, -17.8], [4.5, -15.6], [4.7, -12.0],
+          [2.8, -9.0], [0, -8.6], [-2.8, -9.0]], b), furGrad(ctx, -18.5 + b, -9 + b, SH_C.furTop, SH_C.fur), lw);
+        // 前足
+        straightLeg(ctx, -2.1, -9.6 + b, 0, lg.nF * lift, 2.9, 2.0, SH_C.legFur, SH_C.paw, 1.05, lw);
+        straightLeg(ctx, 2.1, -9.6 + b, 0, lg.fF * lift, 2.9, 2.0, SH_C.legFur, SH_C.paw, 1.05, lw);
+        // 胸の白（裏白）
+        shape(ctx, lift2([[-2.9, -12.8], [-2.2, -14.6], [0, -14.8], [2.2, -14.6], [2.9, -12.8], [2.3, -9.6], [0, -8.4], [-2.3, -9.6]], b), SH_C.white, lw);
+        ctx.strokeStyle = "rgba(150,110,80,0.25)"; ctx.lineWidth = 0.35;
+        ctx.beginPath(); ctx.moveTo(-1.2, -11.0 + b); ctx.lineTo(-0.8, -9.8 + b);
+        ctx.moveTo(1.2, -11.0 + b); ctx.lineTo(0.8, -9.8 + b); ctx.moveTo(0, -10.6 + b); ctx.lineTo(0, -9.4 + b); ctx.stroke();
+      } else {
+        // 座る：後ろ足のももが両わきに出て、胸が高い
+        oval(ctx, -3.7, -0.5, 1.2, 0.6, 0, SH_C.paw, lw);
+        oval(ctx, 3.7, -0.5, 1.2, 0.6, 0, SH_C.paw, lw);
+        oval(ctx, -3.4, -3.4, 2.3, 3.0, 0.2, SH_C.fur, lw);
+        oval(ctx, 3.4, -3.4, 2.3, 3.0, -0.2, SH_C.fur, lw);
+        shape(ctx, [[-4.0, -3.0], [-4.4, -9.0], [-3.4, -14.5], [0, -16.6], [3.4, -14.5], [4.4, -9.0], [4.0, -3.0], [0, -1.8]],
+          furGrad(ctx, -17, -3, SH_C.furTop, SH_C.fur), lw);
+        shibaCurlTop(ctx, 4.0 + w * 0.4, -4.6, 1.5, 1.3, w, lw);
+        straightLeg(ctx, -1.6, -8.5, 0, 0, 2.3, 1.7, SH_C.legFur, SH_C.paw, 1.0, lw);
+        straightLeg(ctx, 1.6, -8.5, 0, 0, 2.3, 1.7, SH_C.legFur, SH_C.paw, 1.0, lw);
+        shape(ctx, [[-3.0, -14.0], [0, -15.2], [3.0, -14.0], [3.2, -10.0], [1.8, -7.2], [0, -6.6], [-1.8, -7.2], [-3.2, -10.0]], SH_C.white, lw);
+      }
+      // 頭
+      const hy = sit ? -18.4 : -16.8 + b;
+      ctx.save();
+      ctx.translate(0, hy);
+      ctx.rotate(s.state === "idle" || sit ? shibaIdle(s).tilt : 0);
+      ctx.scale(1.12, 1.12);
+      shibaFace(ctx, s, P, lw, false);
+      ctx.restore();
+      ctx.restore();
+    }
+
+    // 後ろ（向こうへ行く）。奥にある頭は上にずれ、手前のおしりと後ろ足が大きく見える
+    function drawShibaBack(ctx, s, lw) {
+      const lg = frontBackLegs(s, s.state === "run" ? SH.run : SH.walk);
+      const sit = s.state === "sit";
+      const lift = s.state === "run" ? 2.6 : 1.6;
+      const P = { earBack: s.state === "run" ? 0.6 : 0 };
+      const b = lg.bob, w = shibaWag(s);
+      ctx.save();
+      ctx.translate(lg.sway, 0);
+      // 頭（いちばん奥）
+      ctx.save(); ctx.translate(0, sit ? -18.6 : -20.0 + b);
+      ctx.rotate(s.state === "idle" || sit ? shibaIdle(s).tilt : 0);
+      ctx.scale(1.12, 1.12);
+      shibaFace(ctx, s, P, lw, true);
+      ctx.restore();
+      if (!sit) {
+        // 前足（奥）
+        straightLeg(ctx, -2.1, -10.0 + b, -4.4, lg.fF * lift * 0.7, 2.2, 1.5, SH_C.farFur, SH_C.farPaw, 0.85, lw, true);
+        straightLeg(ctx, 2.1, -10.0 + b, -4.4, lg.nF * lift * 0.7, 2.2, 1.5, SH_C.farFur, SH_C.farPaw, 0.85, lw, true);
+        // 後ろ足（手前）。上の端は胴がおおう
+        [-1, 1].forEach(function (d) {
+          const l = d < 0 ? lg.nH : lg.fH;
+          straightLeg(ctx, d * 2.7, -9.0 + b, 0, l * lift, 3.1, 1.9, SH_C.legFur, SH_C.paw, 1.0, lw);
+          ctx.strokeStyle = "rgba(251,242,228,0.85)"; ctx.lineWidth = 0.7;      // 足の内側の白
+          ctx.beginPath(); ctx.moveTo(d * 1.7, -7.4 + b); ctx.lineTo(d * 2.0, -1.2 - l * lift); ctx.stroke();
+        });
+        // 胴（背中を後ろ上から）
+        const body = lift2([[-4.4, -12.6], [-3.9, -16.4], [-2.8, -18.8], [0, -19.5], [2.8, -18.8], [3.9, -16.4], [4.4, -12.6],
+          [4.9, -10.2], [3.8, -7.3], [0, -6.8], [-3.8, -7.3], [-4.9, -10.2]], b);
+        shape(ctx, body, furGrad(ctx, -20 + b, -8 + b, SH_C.furTop, SH_C.fur), lw);
+        inside(ctx, body, function (c) {
+          oval(c, 0, -7.2 + b, 2.2, 2.8, 0, SH_C.white, lw, null);          // おしりの白い毛（裏白）
+          c.strokeStyle = "rgba(160,85,35,0.35)"; c.lineWidth = 1.2;         // 背すじの濃い毛
+          c.beginPath(); c.moveTo(0, -19.4 + b); c.lineTo(0, -13.0 + b); c.stroke();
+          c.strokeStyle = OL_SOFT; c.lineWidth = lw;                          // ももの盛り上がり
+          [-1, 1].forEach(function (d) {
+            c.beginPath(); c.ellipse(d * 2.4, -9.6 + b, 2.0, 2.9, 0, d < 0 ? 1.6 : -0.3, d < 0 ? 3.4 : 1.5); c.stroke();
+          });
+        });
+        smooth(ctx, body, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+        shibaCurlTop(ctx, w * 1.0, -15.2 + b, 2.6, 2.1, w, lw);
+      } else {
+        // 座る：上の背中 → 地面に広がるおしり
+        oval(ctx, -4.2, -0.6, 1.1, 0.55, 0, SH_C.farPaw, lw);
+        oval(ctx, 4.2, -0.6, 1.1, 0.55, 0, SH_C.farPaw, lw);
+        shape(ctx, [[-3.8, -6.0], [-4.0, -12.0], [-3.0, -16.0], [0, -17.0], [3.0, -16.0], [4.0, -12.0], [3.8, -6.0]],
+          furGrad(ctx, -17, -6, SH_C.furTop, SH_C.fur), lw);
+        shape(ctx, [[-5.2, -2.0], [-5.0, -6.0], [-3.6, -9.0], [0, -9.6], [3.6, -9.0], [5.0, -6.0], [5.2, -2.0], [3.0, -0.6], [0, -0.4], [-3.0, -0.6]],
+          SH_C.fur, lw);
+        oval(ctx, 0, -1.4, 2.4, 1.1, 0, SH_C.white, lw, null);
+        shibaCurlTop(ctx, w * 0.6, -7.6, 2.4, 2.0, w, lw);
+      }
+      ctx.restore();
+    }
+
+    ANIMAL_ART.shiba = {
+      size: { w: 26, h: 24 },
+      states: ["idle", "walk", "run", "sit", "wag"],
+      draw: function (ctx, s0) {
+        const s = norm(s0);
+        ctx.save();
+        const lw = lineW(ctx);
+        if (s.view === "front") drawShibaFront(ctx, s, lw);
+        else if (s.view === "back") drawShibaBack(ctx, s, lw);
+        else drawSide(ctx, SH, s, shibaSideParts);
+        ctx.restore();
+      }
+    };
+
+    // ------------------------------------------------------------
+    // 猫（茶トラ・三毛・ハチワレ）。しなやかな体・長いしっぽ
+    //   肩の高さ 約9px（0.2マス）
+    // ------------------------------------------------------------
+    const CAT_COL = {
+      chatora: { base: "#e7a35f", top: "#efb676", dark: "#c27a3a", stripe: "rgba(176,100,40,0.7)", belly: "#f7e6c9", paw: "#f4dcb8", far: "#c6874c", farPaw: "#d9b98f" },
+      mike: { base: "#f8f4ee", top: "#fffdf9", dark: "#ddd5c9", orange: "#e39a50", black: "#3b3330", belly: "#f8f4ee", paw: "#f6f0e8", far: "#d8d0c4", farPaw: "#d8d0c4" },
+      hachiware: { base: "#3a3431", top: "#4a433f", dark: "#2a2523", belly: "#f7f3ed", paw: "#f7f3ed", far: "#2c2725", farPaw: "#d6d0c8" }
+    };
+    function catCol(s) { return CAT_COL[s.variant] || CAT_COL.chatora; }
+
+    const CT = {
+      c: null,
+      center: [0, -7],
+      frontTop: [3.1, -6.4], elbow: [-0.3, 2.0], fl1: 2.9, fl2: 1.7, frontX: 3.4,
+      hindTop: [-4.6, -7.0], hl1: 3.1, hl2: 3.1, meta: [-0.7, -2.4], hindX: -4.3,
+      frontW: [1.7, 1.25, 0.95, 0.85], hindW: [2.3, 1.4, 0.95, 0.85], pawR: 0.62,
+      farUp: 0.35, liftF: 1.1, liftH: 1.0,
+      thigh: [-4.7, -6.9, 2.3, 2.6, 0.3], thighRest: Math.atan2(3, 1.4),
+      shoulder: [3.1, -7.0, 1.6, 2.2, -0.2],
+      headPivot: [6.4, -10.3],
+      // 確かめ後の手直し：歩幅を本物に近づけた（歩く 1.5→2.4・走る 3.2→4.0、走るときの足を離す時間 0.52→0.62）。
+      // 1周期で進む長さ＝2×stride÷(1−swing)＝歩く 8.0px・走る 21.1px（ANIMAL_KIND の stride・runStride と合わせる）
+      walk: { stride: 2.4, swing: 0.4, bob: 0.18 },
+      run: { stride: 4.0, swing: 0.62, bob: 0.8, pitch: 0.09 },
+      swingU: [2.5, 2.5],              // 足のふりの支点（前＝肩、後ろ＝腰）が、足の付け根の何 px 上にあるか
+      runEarBack: 0.5, runMouth: 0,
+      sitRot: 0.78, sitPivot: [-5.0, -6.0], sitShift: [2.2, 4.4],
+      sitFrontX: -0.4, sitHindPaw: [-0.2, 0], sitHock: 2.4, sitThigh: [-4.2, -7.2], sitHead: [-0.6, 1.4], headScale: 1.1
+    };
+    // 胴（首まで含めた形。首の上は頭がおおう）
+    const CAT_BODY = [[2.6, -9.3], [-1.0, -9.7], [-4.4, -9.7], [-6.2, -8.6], [-6.6, -6.8], [-5.4, -5.1],
+      [-3.4, -5.4], [0.0, -4.9], [2.8, -5.3], [4.6, -6.8], [6.1, -8.4], [7.1, -9.6], [5.9, -11.2], [3.8, -10.7]];
+    const CAT_BELLY = [[5.0, -8.0], [4.4, -6.2], [2.8, -4.8], [0, -4.4], [-3.4, -4.9], [-3.6, -5.8], [0, -6.0], [2.8, -6.4]];
+    const CAT_HEAD = [[-1.6, 0.4], [-1.5, -1.4], [-0.2, -2.1], [1.3, -1.9], [2.3, -1.0], [2.8, -0.2],
+      [2.7, 0.5], [1.7, 1.1], [0.0, 1.45], [-1.3, 1.2]];
+
+    // しっぽの形（付け根から先へ）。state と時間で曲げる
+    function catTailPts(s) {
+      const t = s.t || 0, st = s.state;
+      const sway = Math.sin(t * 2.1 + s.seed * 7);
+      if (st === "sit" || st === "groom") {
+        // 足に巻く（地面ぞいに前へ）
+        const tip = Math.sin(t * 1.6 + s.seed * 4) * 0.35;
+        return [[0, 0], [-0.6, 2.0], [0.6, 3.6], [3.0, 4.2], [5.4, 4.1], [6.8, 3.6 + tip]];
+      }
+      if (st === "run") {
+        return [[0, 0], [-1.8, -0.7], [-3.6, -1.0], [-5.2, -0.8 + Math.sin(s.phase * TAU) * 0.6]];
+      }
+      if (st === "walk") {
+        const w = Math.sin((s.phase || 0) * TAU) * 0.35;
+        return [[0, 0], [-1.4, -1.9], [-1.9 + w, -4.6], [-1.4 + w, -7.0], [-0.2 + w * 1.5, -7.9]];
+      }
+      // idle：立てたしっぽの先だけがゆれる
+      return [[0, 0], [-1.4, -1.9], [-1.9, -4.6], [-1.5, -6.9], [-0.4 + sway * 0.9, -7.8 + Math.abs(sway) * 0.2]];
+    }
+
+    // しっぽを描く（太さが先へ細くなる）。模様は variant ごと
+    function catTail(ctx, s, pts, lw) {
+      const C = catCol(s);
+      const n = pts.length;
+      // なめらかにするため点を増やす
+      const dense = [];
+      for (let i = 0; i < n - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        const p0 = pts[Math.max(i - 1, 0)], p3 = pts[Math.min(i + 2, n - 1)];
+        for (let k = 0; k < 4; k++) {
+          const u = k / 4, u2 = u * u, u3 = u2 * u;
+          const f = function (j) {
+            return 0.5 * ((2 * a[j]) + (-p0[j] + b[j]) * u + (2 * p0[j] - 5 * a[j] + 4 * b[j] - p3[j]) * u2 + (-p0[j] + 3 * a[j] - 3 * b[j] + p3[j]) * u3);
+          };
+          dense.push([f(0), f(1)]);
+        }
+      }
+      dense.push(pts[n - 1]);
+      const dw = dense.map(function (p, i) { return 1.55 - 0.6 * i / (dense.length - 1); });
+      const base = s.variant === "mike" ? C.orange : (s.variant === "hachiware" ? C.base : C.base);
+      limb(ctx, dense, dw, base, lw);
+      // 模様
+      if (s.variant === "chatora") {
+        ctx.strokeStyle = C.stripe; ctx.lineWidth = 0.55;
+        for (let i = 3; i < dense.length - 1; i += 3) {
+          const p = dense[i], q = dense[i + 1];
+          const tx = q[0] - p[0], ty = q[1] - p[1], l = Math.hypot(tx, ty) || 1;
+          const w = dw[i] * 0.42;
+          ctx.beginPath(); ctx.moveTo(p[0] - ty / l * w, p[1] + tx / l * w); ctx.lineTo(p[0] + ty / l * w, p[1] - tx / l * w); ctx.stroke();
+        }
+      } else if (s.variant === "mike") {
+        // 先が黒
+        const m = Math.floor(dense.length * 0.62);
+        limb(ctx, dense.slice(m), dw.slice(m), C.black, lw);
+      }
+    }
+
+    // 猫の耳（横向き）
+    function catEarSide(ctx, s, far, back, lw) {
+      const C = catCol(s);
+      ctx.save();
+      ctx.translate(far ? -0.9 : 0.15, far ? -1.5 : -1.7);
+      ctx.rotate(-back * 0.8 + (far ? -0.1 : 0));
+      let col = far ? C.dark : C.base;
+      if (s.variant === "mike") col = far ? shade(C.black, 0.0) : C.orange;
+      shape(ctx, [[-0.9, 0.3], [-0.25, -2.4], [0.85, 0.1]], col, lw);
+      if (!far) shape(ctx, [[-0.45, 0.05], [-0.2, -1.6], [0.35, -0.05]], "#f2b8b0", lw, null);
+      ctx.restore();
+    }
+
+    // 猫の体の模様（横向き）。region＝"body" | "neck" | "head"
+    function catPatternSide(c, s, region, lw) {
+      const C = catCol(s);
+      if (s.variant === "chatora") {
+        c.strokeStyle = C.stripe; c.lineWidth = 0.6;
+        if (region === "body") {
+          for (let i = 0; i < 6; i++) {
+            const x = 2.2 - i * 1.55;
+            c.beginPath(); c.moveTo(x + 0.3, -10.2); c.quadraticCurveTo(x - 0.5, -8.4, x + 0.1, -6.6); c.stroke();
+          }
+          c.lineWidth = 0.8;
+          c.beginPath(); c.moveTo(2.6, -9.6); c.lineTo(-4.6, -9.9); c.stroke();     // 背すじの濃い線
+        } else if (region === "neck") {
+          c.beginPath(); c.moveTo(3.5, -11.2); c.quadraticCurveTo(4.4, -10.2, 5.6, -10.2); c.stroke();
+        } else if (region === "head") {
+          c.lineWidth = 0.45;
+          c.beginPath(); c.moveTo(0.4, -2.0); c.lineTo(0.7, -1.2); c.moveTo(-0.3, -1.9); c.lineTo(0.0, -1.1);
+          c.moveTo(-0.6, 0.0); c.lineTo(0.7, -0.1); c.moveTo(-0.5, 0.6); c.lineTo(0.8, 0.5); c.stroke();
+        }
+      } else if (s.variant === "mike") {
+        if (region === "body") {
+          const r1 = rnd(s.seed, 1), r2 = rnd(s.seed, 2);
+          shape(c, [[-1.5 + r1, -10.2], [-4.6 + r1, -10.4], [-5.4 + r1, -8.0], [-3.2 + r1, -7.0], [-1.0 + r1, -7.8]], C.orange, lw, null);
+          shape(c, [[1.8 + r2, -10.0], [-0.6 + r2, -10.3], [-1.0 + r2, -8.4], [0.6 + r2, -7.6], [2.0 + r2, -8.4]], C.black, lw, null);
+          shape(c, [[-5.2, -10.0], [-7.0, -9.0], [-6.8, -6.4], [-5.4, -7.0]], C.black, lw, null);
+        } else if (region === "head") {
+          shape(c, [[-1.8, -2.4], [0.9, -2.4], [0.6, -0.6], [-0.4, 0.3], [-1.8, 0.4]], C.orange, lw, null);
+          shape(c, [[0.3, -2.4], [2.0, -2.0], [1.9, -0.7], [1.0, -0.3], [0.5, -1.0]], C.black, lw, null);
+        }
+      } else if (s.variant === "hachiware") {
+        if (region === "body") shape(c, CAT_BELLY.map(function (p) { return [p[0], p[1] - 0.6]; }), C.belly, lw, null);
+        if (region === "neck") shape(c, [[7.0, -10.6], [6.8, -9.0], [4.8, -6.8], [3.8, -7.6], [5.0, -9.6], [6.0, -10.8]], C.belly, lw, null);
+        if (region === "head") shape(c, [[1.0, -0.6], [1.6, -1.4], [2.4, -0.6], [3.0, -0.1], [2.8, 0.7], [1.6, 1.3], [0.0, 1.7], [-0.6, 0.8]], C.belly, lw, null);
+      }
+      if (region === "body" && s.variant !== "hachiware") {
+        shape(c, CAT_BELLY, C.belly, lw, null);
+      }
+    }
+
+    // 猫の目（横向き）
+    function catEyeSide(ctx, s, x, y, lw) {
+      if (blinking(s) || s.state === "groom" && (s.t % 2.4) < 1.2) {
+        ctx.beginPath(); ctx.moveTo(x - 0.45, y + 0.05); ctx.quadraticCurveTo(x, y + 0.25, x + 0.45, y);
+        ctx.strokeStyle = "#2a2320"; ctx.lineWidth = lw * 0.8; ctx.stroke();
+        return;
+      }
+      oval(ctx, x, y, 0.46, 0.36, -0.12, "#cdbf44", lw * 0.6, "rgba(40,30,20,0.7)");
+      oval(ctx, x + 0.08, y, 0.12, 0.3, 0, "#1f1a17", lw, null);
+      oval(ctx, x + 0.18, y - 0.13, 0.08, 0.08, 0, "#ffffff", lw, null);
+    }
+
+    // 毛づくろい：周期の中の位置（0〜0.5＝前足をなめる、0.5〜1＝前足で顔をこする）
+    function groomPhase(s) { return ((s.t || 0) % 2.4) / 2.4; }
+
+    const catSideParts = {
+      tailBehind: true,
+      body: function (ctx, s, P, lw) {
+        const C = catCol(s);
+        shape(ctx, CAT_BODY, furGrad(ctx, -10, -5, C.top, C.base), lw);
+        inside(ctx, CAT_BODY, function (c) { catPatternSide(c, s, "body", lw); catPatternSide(c, s, "neck", lw); });
+        smooth(ctx, CAT_BODY, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      },
+      headTilt: function (s, P) {
+        if (s.state === "groom") {
+          const g = groomPhase(s);
+          return g < 0.5 ? 0.55 + Math.sin(g * 2 * TAU * 2) * 0.12 : 0.25 + Math.sin((g - 0.5) * 2 * Math.PI) * 0.25;
+        }
+        if (s.state === "run") return 0.1;
+        if (s.state === "walk") return 0.12;     // 猫は歩くとき頭が少し低い
+        return Math.sin((s.t || 0) * 0.5 + s.seed * 6) * 0.06;
+      },
+      head: function (ctx, s, P, lw) {
+        const C = catCol(s);
+        catEarSide(ctx, s, true, P.earBack, lw);
+        shape(ctx, CAT_HEAD, C.base, lw);
+        inside(ctx, CAT_HEAD, function (c) {
+          if (s.variant !== "hachiware") oval(c, 1.9, 0.6, 1.3, 0.8, 0, C.belly, lw, null);   // 口のまわりの明るい毛
+          catPatternSide(c, s, "head", lw);
+        });
+        smooth(ctx, CAT_HEAD, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+        catEyeSide(ctx, s, 1.35, -0.55, lw);
+        oval(ctx, 2.65, -0.15, 0.25, 0.18, 0, "#d98a8a", lw, null);        // 鼻
+        ctx.beginPath(); ctx.moveTo(2.6, 0.05); ctx.quadraticCurveTo(2.4, 0.55, 1.9, 0.55);
+        ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.6; ctx.stroke();
+        // ひげ
+        ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 0.18;
+        ctx.beginPath();
+        ctx.moveTo(2.2, 0.25); ctx.lineTo(4.6, -0.2);
+        ctx.moveTo(2.2, 0.4); ctx.lineTo(4.7, 0.5);
+        ctx.moveTo(2.1, 0.55); ctx.lineTo(4.3, 1.2);
+        ctx.stroke();
+        if (s.variant === "hachiware" || s.variant === "mike") {
+          ctx.strokeStyle = "rgba(60,50,45,0.5)"; ctx.lineWidth = 0.15; ctx.stroke();
+          ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 0.18; ctx.stroke();
+        }
+        catEarSide(ctx, s, false, P.earBack, lw);
+        // 毛づくろいの舌
+        if (s.state === "groom" && groomPhase(s) < 0.5 && Math.sin(groomPhase(s) * 2 * TAU * 2) > 0) {
+          oval(ctx, 2.3, 0.95, 0.35, 0.25, 0.4, "#e7848c", lw * 0.6);
+        }
+      },
+      tail: function (ctx, s, F, P, lw) {
+        const base = F.pt(P.sit ? [-5.6, -6.6] : [-6.0, -8.4]);
+        const pts = catTailPts(s).map(function (p) { return [p[0] + base[0], p[1] + base[1]]; });
+        if (P.sit) return;       // 座るときのしっぽは、体の前（sitFront）で描く
+        catTail(ctx, s, pts, lw);
+      },
+      sitFront: function (ctx, s, F, P, lw) {
+        // 足に巻いたしっぽ（地面ぞい）
+        const base = [Math.min(F.pt([-5.6, -6.6])[0], -3.8), -1.2];
+        const pts = catTailPts(s).map(function (p, i) { return [p[0] * 0.95 + base[0] + (i === 0 ? 0 : 0), p[1] * 0.25 + base[1]]; });
+        catTail(ctx, s, pts, lw);
+      },
+      leg: function (ctx, pts, far, hind, lw, s) {
+        const C = catCol(s);
+        // ハチワレの白い靴下・茶トラの足のしま
+        if (s.variant === "hachiware") {
+          const a = pts[2], b = pts[3];
+          limb(ctx, [[a[0] + (b[0] - a[0]) * 0.2, a[1] + (b[1] - a[1]) * 0.2], b], [hind ? 1.0 : 1.0, 0.9], far ? "#d6d0c8" : C.belly, lw);
+        } else if (s.variant === "chatora" && !far) {
+          ctx.strokeStyle = C.stripe; ctx.lineWidth = 0.45;
+          const a = pts[1], b = pts[2];
+          for (let k = 1; k <= 2; k++) {
+            const u = k / 3, x = a[0] + (b[0] - a[0]) * u, y = a[1] + (b[1] - a[1]) * u;
+            ctx.beginPath(); ctx.moveTo(x - 0.5, y); ctx.lineTo(x + 0.5, y - 0.15); ctx.stroke();
+          }
+        } else if (s.variant === "mike" && hind && !far) {
+          limb(ctx, [pts[0], pts[1]], [2.0, 1.2], C.orange, lw, null);
+        }
+      },
+      sitThigh: function (ctx, th, s, lw) {
+        const C = catCol(s);
+        if (s.variant === "mike") oval(ctx, th[0] - 0.4, th[1] - 0.6, 1.5, 1.4, 0, C.orange, lw, null);
+        if (s.variant === "chatora") {
+          ctx.strokeStyle = C.stripe; ctx.lineWidth = 0.5;
+          ctx.beginPath(); ctx.arc(th[0] + 0.6, th[1] + 0.4, 1.4, Math.PI * 0.9, Math.PI * 1.5); ctx.stroke();
+          ctx.beginPath(); ctx.arc(th[0] + 0.6, th[1] + 0.4, 0.6, Math.PI * 0.9, Math.PI * 1.5); ctx.stroke();
+        }
+      },
+      // 毛づくろいの前足（口もとへ上げる → 顔をこする）
+      groomPaw: function (s, F) {
+        const g = groomPhase(s);
+        const top = F.pt(CT.frontTop);
+        const hp = F.pt(CT.headPivot);
+        hp[0] += CT.sitHead[0]; hp[1] += CT.sitHead[1];
+        let paw;
+        if (g < 0.5) paw = [hp[0] + 1.8, hp[1] + 2.0];
+        else {
+          const u = (g - 0.5) * 2;
+          paw = [hp[0] + 1.4 - Math.sin(u * Math.PI) * 1.6, hp[1] + 1.2 - Math.sin(u * Math.PI) * 2.2];
+        }
+        const mid = ik(top, paw, 2.9, 2.4, 1);
+        return [top, mid, [paw[0] - 0.3, paw[1] + 0.3], paw];
+      }
+    };
+
+    // ---- 猫：正面と後ろ ----
+    function catFace(ctx, s, lw, back, earBack) {
+      const C = catCol(s);
+      const head = [[-2.1, 0.3], [-2.0, -1.2], [-1.0, -1.9], [0, -2.0], [1.0, -1.9], [2.0, -1.2], [2.1, 0.3], [1.5, 1.4], [0, 1.8], [-1.5, 1.4]];
+      // 耳
+      [-1, 1].forEach(function (d) {
+        ctx.save(); ctx.translate(d * 1.3, -1.5); ctx.rotate(d * (0.25 + earBack * 0.6));
+        let col = back ? C.dark : C.base;
+        if (s.variant === "mike") col = d < 0 ? C.orange : C.black;
+        shape(ctx, [[-0.95, 0.3], [0, -2.5], [0.95, 0.3]], col, lw);
+        if (!back) shape(ctx, [[-0.5, 0.1], [0, -1.6], [0.5, 0.1]], "#f2b8b0", lw, null);
+        ctx.restore();
+      });
+      shape(ctx, head, back ? furGrad(ctx, -2, 1.8, C.top, C.dark) : C.base, lw);
+      inside(ctx, head, function (c) {
+        if (s.variant === "chatora") {
+          c.strokeStyle = C.stripe; c.lineWidth = 0.45;
+          if (back) {
+            for (let i = 0; i < 3; i++) { c.beginPath(); c.moveTo(-1.6 + i * 1.6, -1.9); c.lineTo(-1.4 + i * 1.4, 0.4); c.stroke(); }
+          } else {
+            c.beginPath(); c.moveTo(-0.5, -1.9); c.lineTo(-0.3, -1.1); c.moveTo(0, -2.0); c.lineTo(0, -1.0); c.moveTo(0.5, -1.9); c.lineTo(0.3, -1.1);
+            c.moveTo(-2.1, -0.2); c.lineTo(-1.3, -0.1); c.moveTo(2.1, -0.2); c.lineTo(1.3, -0.1); c.stroke();
+          }
+        } else if (s.variant === "mike") {
+          shape(c, [[-2.4, -2.2], [0.2, -2.3], [-0.2, -0.6], [-1.3, 0.0], [-2.4, 0.2]], C.orange, lw, null);
+          shape(c, [[0.4, -2.3], [2.4, -2.0], [2.4, -0.2], [1.2, -0.4], [0.6, -1.0]], C.black, lw, null);
+        } else if (s.variant === "hachiware" && !back) {
+          // 鼻すじから下が白い「八の字」
+          shape(c, [[0, -1.5], [0.7, -0.6], [2.2, 0.3], [1.6, 1.6], [0, 2.0], [-1.6, 1.6], [-2.2, 0.3], [-0.7, -0.6]], C.belly, lw, null);
+        }
+        if (!back && s.variant === "chatora") oval(c, 0, 0.9, 1.4, 0.8, 0, C.belly, lw, null);
+      });
+      smooth(ctx, head, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+      if (back) return;
+      // 目・鼻・口・ひげ
+      [-1, 1].forEach(function (d) {
+        if (blinking(s) || s.state === "groom" && groomPhase(s) < 0.5) {
+          ctx.beginPath(); ctx.moveTo(d * 0.45, -0.45); ctx.quadraticCurveTo(d * 0.9, -0.25, d * 1.35, -0.5);
+          ctx.strokeStyle = "#2a2320"; ctx.lineWidth = lw * 0.8; ctx.stroke();
+        } else {
+          oval(ctx, d * 0.9, -0.5, 0.48, 0.38, d * 0.15, "#cdbf44", lw * 0.6, "rgba(40,30,20,0.7)");
+          oval(ctx, d * 0.9, -0.5, 0.12, 0.32, 0, "#1f1a17", lw, null);
+          oval(ctx, d * 0.9 + 0.13, -0.65, 0.08, 0.08, 0, "#ffffff", lw, null);
+        }
+      });
+      shape(ctx, [[-0.32, 0.25], [0.32, 0.25], [0, 0.55]], "#d98a8a", lw * 0.5);
+      ctx.beginPath(); ctx.moveTo(0, 0.55); ctx.lineTo(0, 0.8);
+      ctx.moveTo(-0.5, 0.95); ctx.quadraticCurveTo(-0.2, 1.05, 0, 0.8); ctx.quadraticCurveTo(0.2, 1.05, 0.5, 0.95);
+      ctx.strokeStyle = OL; ctx.lineWidth = lw * 0.55; ctx.stroke();
+      ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 0.17;
+      ctx.beginPath();
+      [-1, 1].forEach(function (d) {
+        ctx.moveTo(d * 0.7, 0.6); ctx.lineTo(d * 3.0, 0.1);
+        ctx.moveTo(d * 0.7, 0.75); ctx.lineTo(d * 3.1, 0.8);
+        ctx.moveTo(d * 0.7, 0.9); ctx.lineTo(d * 2.8, 1.5);
+      });
+      ctx.stroke();
+      if (s.variant !== "chatora") {
+        ctx.strokeStyle = "rgba(60,50,45,0.35)"; ctx.lineWidth = 0.12; ctx.stroke();
+      }
+    }
+
+    function drawCatFront(ctx, s, lw) {
+      const C = catCol(s);
+      const lg = frontBackLegs(s, s.state === "run" ? CT.run : CT.walk);
+      const sitLike = s.state === "sit" || s.state === "groom";
+      const lift = s.state === "run" ? 1.8 : 1.1;
+      ctx.save(); ctx.translate(lg.sway * 0.7, 0);
+      const legC = function (far) { return far ? C.far : (s.variant === "mike" ? C.base : C.base); };
+      const pawC = function (far) { return far ? C.farPaw : C.paw; };
+      if (!sitLike) {
+        const b = lg.bob;
+        // 奥：後ろ足・立てたしっぽ・背中
+        straightLeg(ctx, -1.4, -6.6 + b, -2.8, lg.fH * lift * 0.7, 1.5, 0.95, legC(true), pawC(true), 0.55, lw, true);
+        straightLeg(ctx, 1.4, -6.6 + b, -2.8, lg.nH * lift * 0.7, 1.5, 0.95, legC(true), pawC(true), 0.55, lw, true);
+        const sway = Math.sin((s.t || 0) * 2.1 + s.seed * 7);
+        if (s.state !== "run") {
+          const ww = s.state === "walk" ? Math.sin((s.phase || 0) * TAU) * 0.5 : sway * 0.7;
+          catTail(ctx, s, [[-0.8, -11.6 + b], [-1.8, -13.6 + b], [-2.2 + ww * 0.5, -15.6 + b], [-1.4 + ww, -16.8 + b]], lw);
+        }
+        const body = lift2([[-2.9, -7.6], [-2.8, -10.6], [-1.6, -12.6], [0, -13.0], [1.6, -12.6], [2.8, -10.6], [2.9, -7.6],
+          [1.8, -5.6], [0, -5.3], [-1.8, -5.6]], b);
+        shape(ctx, body, furGrad(ctx, -13 + b, -6 + b, C.top, C.base), lw);
+        inside(ctx, body, function (c) {
+          if (s.variant === "chatora") {
+            c.strokeStyle = C.stripe; c.lineWidth = 0.5;
+            for (let i = 0; i < 3; i++) { const y = -12.4 + i * 1.3 + b; c.beginPath(); c.moveTo(-2.8, y + 0.5); c.quadraticCurveTo(0, y - 0.3, 2.8, y + 0.5); c.stroke(); }
+          } else if (s.variant === "mike") {
+            oval(c, -1.3, -11.4 + b, 1.6, 1.1, 0.3, C.orange, lw, null);
+            oval(c, 1.5, -10.0 + b, 1.3, 1.1, -0.2, C.black, lw, null);
+          }
+        });
+        smooth(ctx, body, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+        // 前足（ハチワレは足先が白）
+        [-1, 1].forEach(function (d) {
+          const l = d < 0 ? lg.nF : lg.fF;
+          straightLeg(ctx, d * 1.2, -6.0 + b, 0, l * lift, 1.5, 1.05, legC(false), pawC(false), 0.62, lw);
+          if (s.variant === "hachiware") limb(ctx, [[d * 1.2, -2.6 - l * lift], [d * 1.2, -0.5 - l * lift]], [1.1, 1.05], C.belly, lw, null);
+        });
+        // 胸
+        oval(ctx, 0, -7.4 + b, 2.0, 2.2, 0, s.variant === "mike" ? C.base : C.belly, lw);
+      } else {
+        // 座る：しっぽを前足に巻く
+        oval(ctx, -2.2, -2.2, 1.6, 2.1, 0.2, C.base, lw);
+        oval(ctx, 2.2, -2.2, 1.6, 2.1, -0.2, C.base, lw);
+        if (s.variant === "mike") oval(ctx, -2.3, -2.6, 1.0, 1.1, 0, C.orange, lw, null);
+        oval(ctx, 0, -6.0, 2.7, 3.7, 0, furGrad(ctx, -10, -2, C.top, C.base), lw);
+        if (s.variant === "mike") oval(ctx, 1.2, -7.6, 1.2, 1.0, 0.3, C.black, lw, null);
+        oval(ctx, 0, -5.8, 1.7, 2.8, 0, s.variant === "mike" ? C.base : C.belly, lw, null);
+        const groomUp = s.state === "groom";
+        const g = groomPhase(s);
+        straightLeg(ctx, -0.9, -5.4, 0, 0, 1.15, 0.95, legC(false), pawC(false), 0.6, lw);
+        if (!groomUp) straightLeg(ctx, 0.9, -5.4, 0, 0, 1.15, 0.95, legC(false), pawC(false), 0.6, lw);
+        // しっぽ（前足の前を横切る）
+        const tip = Math.sin((s.t || 0) * 1.6 + s.seed * 4) * 0.3;
+        const tpts = [[2.8, -1.4], [1.8, -0.5], [0, -0.35], [-1.8, -0.5], [-2.6, -1.0 + tip]];
+        limb(ctx, tpts, [1.3, 1.25, 1.15, 1.0, 0.8], s.variant === "mike" ? C.orange : C.base, lw);
+        if (s.variant === "mike") limb(ctx, tpts.slice(3), [1.0, 0.8], C.black, lw);
+        if (s.variant === "chatora") {
+          ctx.strokeStyle = C.stripe; ctx.lineWidth = 0.45;
+          [1.2, -0.4, -1.8].forEach(function (x) { ctx.beginPath(); ctx.moveTo(x, -0.95); ctx.lineTo(x - 0.1, 0.15); ctx.stroke(); });
+        }
+        if (groomUp) {
+          // 片方の前足を口もとへ
+          const u = g < 0.5 ? 0 : Math.sin((g - 0.5) * 2 * Math.PI);
+          const px = 0.6 + u * 0.4, py = -10.0 - u * 1.4;
+          limb(ctx, [[0.9, -5.6], [1.3, -7.6], [px, py]], [1.15, 1.0, 0.9], legC(false), lw);
+          oval(ctx, px, py, 0.6, 0.5, 0, pawC(false), lw);
+        }
+      }
+      // 頭
+      let hy = sitLike ? -10.6 : -10.6 + lg.bob;
+      let tilt = Math.sin((s.t || 0) * 0.5 + s.seed * 6) * 0.06;
+      if (s.state === "groom") {
+        const g = groomPhase(s);
+        tilt = g < 0.5 ? 0.25 : 0.25 + Math.sin((g - 0.5) * 2 * Math.PI) * 0.2;
+        hy += g < 0.5 ? 0.6 + Math.sin(g * 2 * TAU * 2) * 0.2 : 0.2;
+      }
+      ctx.save(); ctx.translate(0, hy); ctx.rotate(tilt);
+      catFace(ctx, s, lw, false, s.state === "run" ? 0.5 : 0);
+      ctx.restore();
+      if (s.state === "groom" && groomPhase(s) >= 0.5) {
+        // 顔をこする前足は頭の手前
+        const u = Math.sin((groomPhase(s) - 0.5) * 2 * Math.PI);
+        const px = 0.6 + u * 0.4, py = -10.0 - u * 1.4;
+        limb(ctx, [[1.3, -7.6], [px, py]], [1.0, 0.9], legC(false), lw);
+        oval(ctx, px, py, 0.6, 0.5, 0, pawC(false), lw);
+      }
+      ctx.restore();
+    }
+
+    function drawCatBack(ctx, s, lw) {
+      const C = catCol(s);
+      const lg = frontBackLegs(s, s.state === "run" ? CT.run : CT.walk);
+      const sitLike = s.state === "sit" || s.state === "groom";
+      const lift = s.state === "run" ? 1.8 : 1.1;
+      ctx.save(); ctx.translate(lg.sway * 0.7, 0);
+      // 頭（奥）
+      let hy = sitLike ? -10.8 : -13.9 + lg.bob;
+      let tilt = 0;
+      if (s.state === "groom") { const g = groomPhase(s); tilt = 0.25; hy += g < 0.5 ? 0.7 : 0.3; }
+      ctx.save(); ctx.translate(0, hy); ctx.rotate(tilt);
+      catFace(ctx, s, lw, true, s.state === "run" ? 0.5 : 0);
+      ctx.restore();
+      const bodyPts = function (dy) {
+        return lift2([[-2.5, -9.6], [-2.2, -11.6], [-1.4, -12.9], [0, -13.3], [1.4, -12.9], [2.2, -11.6], [2.5, -9.6],
+          [3.0, -7.4], [2.2, -5.0], [0, -4.6], [-2.2, -5.0], [-3.0, -7.4]], dy);
+      };
+      if (!sitLike) {
+        const b = lg.bob;
+        straightLeg(ctx, -1.2, -6.6 + b, -2.8, lg.fF * lift * 0.7, 1.35, 0.9, C.far, C.farPaw, 0.55, lw, true);
+        straightLeg(ctx, 1.2, -6.6 + b, -2.8, lg.nF * lift * 0.7, 1.35, 0.9, C.far, C.farPaw, 0.55, lw, true);
+        // 後ろ足（手前）。上の端は胴がおおう
+        [-1, 1].forEach(function (d) {
+          const l = d < 0 ? lg.nH : lg.fH;
+          straightLeg(ctx, d * 1.7, -6.0 + b, 0, l * lift, 1.6, 1.0, C.base, C.paw, 0.62, lw);
+          if (s.variant === "hachiware") limb(ctx, [[d * 1.7, -2.2 - l * lift], [d * 1.7, -0.5 - l * lift]], [1.05, 1.0], C.belly, lw, null);
+        });
+        const bp = bodyPts(b);
+        shape(ctx, bp, furGrad(ctx, -13.3 + b, -5 + b, C.top, C.base), lw);
+        inside(ctx, bp, function (c) {
+          if (s.variant === "chatora") {
+            c.strokeStyle = C.stripe; c.lineWidth = 0.55;
+            for (let i = 0; i < 5; i++) { const y = -12.6 + i * 1.5 + b; c.beginPath(); c.moveTo(-3.0, y + 0.6); c.quadraticCurveTo(0, y - 0.4, 3.0, y + 0.6); c.stroke(); }
+          } else if (s.variant === "mike") {
+            oval(c, -1.2, -11.0 + b, 1.7, 1.3, 0.3, C.orange, lw, null);
+            oval(c, 1.6, -7.6 + b, 1.4, 1.3, -0.2, C.black, lw, null);
+          }
+          c.strokeStyle = OL_SOFT; c.lineWidth = lw;                          // ももの盛り上がり
+          [-1, 1].forEach(function (d) {
+            c.beginPath(); c.ellipse(d * 1.6, -6.6 + b, 1.4, 2.0, 0, d < 0 ? 1.6 : -0.3, d < 0 ? 3.4 : 1.5); c.stroke();
+          });
+        });
+        smooth(ctx, bp, true); ctx.strokeStyle = OL; ctx.lineWidth = lw; ctx.stroke();
+        // しっぽ（後ろから見ると上へ立つ）
+        const sway = Math.sin((s.t || 0) * 2.1 + s.seed * 7);
+        if (s.state === "run") {
+          catTail(ctx, s, [[0, -7.0 + lg.bob], [0.3, -6.6 + lg.bob], [0.5, -6.2 + lg.bob]], lw);
+        } else {
+          const w = s.state === "walk" ? Math.sin((s.phase || 0) * TAU) * 0.6 : sway * 0.8;
+          catTail(ctx, s, [[0, -6.0 + lg.bob], [1.0 + w * 0.2, -8.6 + lg.bob], [2.4 + w * 0.6, -11.2 + lg.bob], [2.6 + w * 1.2, -13.6 + lg.bob], [1.8 + w * 1.4, -14.6 + lg.bob]], lw);
+        }
+      } else {
+        // 座る：おしりが洋なしの形に広がる
+        oval(ctx, 0, -6.4, 2.6, 3.4, 0, furGrad(ctx, -10, -3, C.top, C.base), lw);
+        oval(ctx, 0, -2.8, 3.4, 2.8, 0, C.base, lw);
+        inside(ctx, [[-3.4, -2.8], [-2.6, -8.8], [0, -9.8], [2.6, -8.8], [3.4, -2.8], [0, 0]], function (c) {
+          if (s.variant === "chatora") {
+            c.strokeStyle = C.stripe; c.lineWidth = 0.55;
+            for (let i = 0; i < 4; i++) { const y = -8.8 + i * 1.5; c.beginPath(); c.moveTo(-3.4, y + 0.6); c.quadraticCurveTo(0, y - 0.4, 3.4, y + 0.6); c.stroke(); }
+          } else if (s.variant === "mike") {
+            oval(c, -1.4, -6.8, 1.7, 1.3, 0.3, C.orange, lw, null);
+            oval(c, 1.5, -3.6, 1.4, 1.2, -0.2, C.black, lw, null);
+          }
+        });
+        // しっぽ（地面ぞいに横へ）
+        const tip = Math.sin((s.t || 0) * 1.6 + s.seed * 4) * 0.4;
+        catTail(ctx, s, [[0, -0.9], [2.0, -0.6], [3.6, -0.7], [4.6, -1.4 + tip]], lw);
+      }
+      ctx.restore();
+    }
+
+    ANIMAL_ART.cat = {
+      size: { w: 20, h: 17 },
+      states: ["idle", "walk", "run", "sit", "groom"],
+      draw: function (ctx, s0) {
+        const s = norm(s0);
+        ctx.save();
+        const lw = lineW(ctx);
+        const C = catCol(s);
+        CT.c = { fur: C.base, legFur: C.base, farFur: C.far, paw: C.paw, farPaw: C.farPaw };
+        if (s.view === "front") drawCatFront(ctx, s, lw);
+        else if (s.view === "back") drawCatBack(ctx, s, lw);
+        else drawSide(ctx, CT, s, catSideParts);
+        ctx.restore();
+      }
+    };
+  })();
+
+  // ------------------------------------------------------------
+  // 動物の絵：ウサギ（rabbit）・アヒル（duck）
+  //   原点＝足元の中心（アヒルが水に浮いているときは、水面の中心）。上が −y。右向きの横向きが基本。
+  //   1マス＝45px（ART_PX）の物差しで描く。影は描かない（仕組みの側で描く）。
+  // ------------------------------------------------------------
+
+  // ウサギ（野ウサギ風の茶色）。状態：idle／walk／hop／alert
+  ANIMAL_ART.rabbit = (function () {
+    const OL = "rgba(40,30,20,0.55)";   // 輪郭（COLORS.outline と同じ色）
+    let LW = 0.8;                        // 輪郭の太さ（外に見える分）。組み込みで変更：draw のはじめに画面上の倍率で決め直す
+    // 組み込みで追加：輪郭の太さを画面上の倍率に合わせる（柴犬・猫と同じ決め方。倍率1で0.8、拡大したときだけ √倍率 で少し太く）
+    function outlineW(ctx) {
+      const m = ctx.getTransform();
+      const sc = Math.max(0.01, Math.hypot(m.a, m.b));
+      return (sc <= 1 ? 0.8 : 0.8 * Math.sqrt(sc)) / sc;
+    }
+
+    function lerp(a, b, u) { return a + (b - a) * u; }
+    function smooth(u) { return u * u * (3 - 2 * u); }
+    function ell(ctx, x, y, rx, ry, rot) { const r = rot || 0; ctx.moveTo(x + Math.max(rx, 0.01) * Math.cos(r), y + Math.max(rx, 0.01) * Math.sin(r)); ctx.ellipse(x, y, Math.max(rx, 0.01), Math.max(ry, 0.01), r, 0, Math.PI * 2); }
+    function rgb(r, g, b) { return "rgb(" + Math.round(r) + "," + Math.round(g) + "," + Math.round(b) + ")"; }
+
+    // 個体ごとの毛色（背中の茶を少しだけ変える）
+    function palette(seed) {
+      const d = (seed - 0.5) * 18;
+      return {
+        backDark: rgb(118 + d, 86 + d * 0.8, 58 + d * 0.5),     // 背中の筋
+        back: rgb(156 + d, 118 + d * 0.8, 82 + d * 0.5),        // 背中
+        flank: rgb(190 + d, 154 + d * 0.8, 112 + d * 0.5),      // 脇腹
+        belly: "#f2ebdf",                                       // 腹
+        far: rgb(128 + d, 96 + d * 0.8, 66 + d * 0.5),          // 向こう側の足・耳（陰）
+        earIn: "#dcbca4", earTip: "#3f3026",
+        eyeRing: "#e2d2b8", eye: "#22160e", nose: "#c49488", tail: "#fbf8f2"
+      };
+    }
+
+    // 個体ごとに決まる乱数（模様の点の位置など）
+    function rnd(seed, i) { const x = Math.sin(seed * 97.13 + i * 12.9898) * 43758.5453; return x - Math.floor(x); }
+
+    // 輪郭つきの線（足）。pts＝点の並び、w＝太さ
+    function limb(ctx, pts, w, col) {
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath(); ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.strokeStyle = OL; ctx.lineWidth = w + LW * 2; ctx.stroke();
+      ctx.strokeStyle = col; ctx.lineWidth = w; ctx.stroke();
+    }
+
+    // 耳の形（耳の付け根が原点、−y へのびる）
+    function earPath(ctx, len, w) {
+      ctx.beginPath();
+      ctx.moveTo(-w * 0.45, 0);
+      ctx.quadraticCurveTo(-w * 0.8, -len * 0.5, -w * 0.28, -len * 0.94);
+      ctx.quadraticCurveTo(0, -len * 1.06, w * 0.3, -len * 0.92);
+      ctx.quadraticCurveTo(w * 0.7, -len * 0.45, w * 0.42, 0);
+      ctx.closePath();
+    }
+    // 耳を1枚描く。ang＝向き（0＝真上、マイナス＝後ろへ倒す）、inner＝内側の色を見せるか
+    function ear(ctx, x, y, ang, len, w, col, c, inner) {
+      ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+      earPath(ctx, len, w);
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      ctx.fillStyle = col; ctx.fill();
+      ctx.save(); ctx.clip();
+      if (inner) {                                            // 内側（うすいピンクがかったベージュ）
+        ctx.fillStyle = c.earIn; ctx.beginPath(); ell(ctx, w * 0.12, -len * 0.5, w * 0.24, len * 0.4); ctx.fill();
+      }
+      ctx.fillStyle = c.earTip; ctx.fillRect(-w, -len * 1.2, w * 2, len * 0.3);   // 耳の先の黒っぽいふち
+      ctx.restore();
+      ctx.restore();
+    }
+
+    // 目（まばたきつき）
+    function eye(ctx, x, y, r, c, blink) {
+      ctx.fillStyle = c.eyeRing; ctx.beginPath(); ell(ctx, x, y, r * 1.45, r * 1.35); ctx.fill();
+      ctx.fillStyle = c.eye; ctx.beginPath(); ell(ctx, x, y, r, r * (blink ? 0.18 : 1)); ctx.fill();
+      if (!blink) { ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.beginPath(); ell(ctx, x - r * 0.35, y - r * 0.35, r * 0.34, r * 0.34); ctx.fill(); }
+    }
+
+    // 跳ねる（hop）の流れ：かがむ → 後ろ足でける → 体がのびて宙に → 前足で着く → 後ろ足が前へ → かがむ
+    //   s＝体ののび、lift＝浮く高さ、pitch＝体の傾き（マイナス＝頭が上）、hind＝後ろ足（0＝たたむ／1＝後ろへのばす）、
+    //   fore＝前足（−1＝後ろ／0＝下／1＝前へ）、ear＝耳の倒れ（0＝立つ／1＝寝る）
+    const HOP = [
+      [0.00, { s: 0.10, lift: 0.0, pitch: 0.06, hind: 0.00, fore: -0.2, ear: 0.45 }],
+      [0.20, { s: 0.55, lift: 0.9, pitch: -0.20, hind: 0.70, fore: 0.10, ear: 0.60 }],
+      [0.42, { s: 1.00, lift: 4.0, pitch: -0.04, hind: 1.00, fore: 0.90, ear: 0.80 }],
+      [0.62, { s: 0.75, lift: 1.4, pitch: 0.20, hind: 0.75, fore: 0.30, ear: 0.70 }],
+      [0.80, { s: 0.30, lift: 0.4, pitch: 0.12, hind: 0.20, fore: -0.3, ear: 0.55 }],
+      [1.00, { s: 0.10, lift: 0.0, pitch: 0.06, hind: 0.00, fore: -0.2, ear: 0.45 }]
+    ];
+    function keyPose(K, ph) {
+      ph = ((ph % 1) + 1) % 1;
+      for (let i = 0; i < K.length - 1; i++) {
+        if (ph >= K[i][0] && ph <= K[i + 1][0]) {
+          const u = smooth((ph - K[i][0]) / (K[i + 1][0] - K[i][0])), a = K[i][1], b = K[i + 1][1], o = {};
+          Object.keys(a).forEach(function (k) { o[k] = lerp(a[k], b[k], u); });
+          return o;
+        }
+      }
+      return K[0][1];
+    }
+
+    // 状態ごとの姿勢
+    function pose(s) {
+      const t = s.t || 0, ph = s.phase || 0, sd = s.seed || 0;
+      const p = { s: 0.3, lift: 0, pitch: 0.04, hind: 0, foreN: -0.1, foreF: 0.1, ear: 0.4, earF: 0.4, head: 0, sitUp: 0, nose: 0 };
+      if (s.state === "hop") {
+        const k = keyPose(HOP, ph);
+        p.s = k.s; p.lift = k.lift; p.pitch = k.pitch; p.hind = k.hind;
+        p.foreN = k.fore; p.foreF = k.fore - 0.25; p.ear = k.ear; p.earF = k.ear + 0.06;
+      } else if (s.state === "walk") {
+        // ゆっくり歩く：前足を片方ずつ前へ出し、後ろ足は小さく寄せる
+        const a = Math.sin(ph * Math.PI * 2), b = Math.cos(ph * Math.PI * 2);
+        p.s = 0.4 + 0.15 * a; p.lift = Math.max(0, -b) * 0.6; p.pitch = 0.05 + 0.04 * b;
+        p.hind = 0.15 + 0.15 * Math.max(0, a);
+        p.foreN = 0.55 * a; p.foreF = -0.55 * a;
+        p.ear = 0.35 + 0.05 * b; p.earF = p.ear + 0.06;
+      } else if (s.state === "alert") {
+        // 耳をまっすぐ立て、胸を起こして止まる。耳だけ少し向きを変える
+        p.s = 0.2; p.pitch = -0.30; p.sitUp = 1; p.hind = 0; p.foreN = 0; p.foreF = 0.1;
+        p.ear = 0.02 + 0.03 * Math.sin(t * 1.7 + sd * 6); p.earF = 0.06 + 0.03 * Math.sin(t * 1.3 + sd * 4);
+        p.head = -0.12;
+      } else {
+        // idle：鼻をひくひく、耳と頭がときどき少し動く
+        p.ear = 0.42 + 0.06 * Math.sin(t * 0.9 + sd * 6); p.earF = p.ear + 0.08;
+        p.head = 0.04 * Math.sin(t * 0.6 + sd * 3);
+        p.s = 0.28 + 0.02 * Math.sin(t * 2.4);              // 呼吸
+      }
+      const tw = (t * 1.0 + sd * 5) % 2.6;                  // 鼻のひくひく（しばらく続いて、少し休む）
+      p.nose = tw < 1.4 ? Math.sin(t * 22) * 0.28 : 0;
+      p.blink = ((t + sd * 7) % 4.3) < 0.12;
+      return p;
+    }
+
+    // 横向き（右向き）
+    function drawSide(ctx, s, c) {
+      const p = pose(s);
+      const baseY = -4.3 - p.lift - p.s * 0.4 - p.sitUp * 0.6;   // 体の中心の高さ
+      const hx = -3.0 - p.s * 0.9, cx = 1.9 + p.s * 1.5;          // おしり・胸の中心（体の中で）
+      const cy = -0.3 - p.sitUp * 1.4;
+      const cs = Math.cos(p.pitch), sn = Math.sin(p.pitch);
+      const W = function (lx, ly) { return { x: lx * cs - ly * sn, y: baseY + lx * sn + ly * cs }; };   // 体の中の点 → 絵の点
+      const ground = 0;
+
+      // 頭の位置（胸の前上）
+      const head = W(cx + 2.7 + p.s * 0.5, cy - 3.0 + p.s * 0.8 - p.sitUp * 0.6);
+      const hr = p.pitch * 0.6 - 0.25 + p.head;                   // 頭の傾き（鼻先が少し下）
+
+      // 後ろ足（かかと H と つま先 T）
+      const J = W(hx + 0.6, 2.0);
+      const footAt = function (dx) {
+        const hk = { x: lerp(J.x - 3.4, J.x - 3.6, p.hind) + dx, y: lerp(ground - 0.9, J.y + 2.6, p.hind) };
+        const toe = { x: lerp(hk.x + 5.0, hk.x - 3.4, p.hind), y: lerp(ground - 0.35, hk.y + 2.0, p.hind) };
+        if (toe.y > ground - 0.3) toe.y = ground - 0.3;
+        if (hk.y > ground - 0.7) hk.y = ground - 0.7;
+        return { H: hk, T: toe };
+      };
+      // 前足（肩 S から足先まで）
+      const S = W(cx + 0.8, 1.6);
+      const pawAt = function (f, dx) {
+        const reach = f >= 0 ? f : f * 0.7;
+        const px = S.x + dx + reach * 3.0;
+        const py = Math.min(ground - 0.35, S.y + 4.2 - Math.max(0, f) * 1.2);
+        return [S, { x: (S.x + px) / 2 + 0.2, y: (S.y + py) / 2 }, { x: px, y: py }];
+      };
+
+      // 1. 向こう側の耳・足（陰の色）
+      ctx.save(); ctx.translate(head.x, head.y); ctx.rotate(hr);
+      ear(ctx, -1.3, -1.5, -0.15 - p.earF * 1.1, 6.0, 1.5, c.far, c, false);
+      ctx.restore();
+      const ff = footAt(1.1);
+      limb(ctx, [J, ff.H], 1.6, c.far); limb(ctx, [ff.H, ff.T], 1.2, c.far);
+      limb(ctx, pawAt(p.foreF, -0.6), 1.0, c.far);
+      const fn = footAt(0);
+      limb(ctx, [J, fn.H], 1.9, c.flank);                            // 手前の後ろ足のすね（上は胴に隠れる）
+
+      // 2. 胴（おしり・胴・胸を1つの形として、外側だけに輪郭）
+      ctx.save(); ctx.translate(0, baseY); ctx.rotate(p.pitch);
+      const parts = function () {
+        ell(ctx, hx, 0.2, 4.3, 3.9, 0);
+        ctx.moveTo((hx + cx) / 2 + (cx - hx) / 2 + 1, -0.4);
+        ell(ctx, (hx + cx) / 2, -0.4, (cx - hx) / 2 + 1.2, 3.1, 0);
+        ctx.moveTo(cx + 3.2, cy);
+        ell(ctx, cx, cy, 3.2, 2.9, 0);
+      };
+      ctx.beginPath(); parts(); ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      ctx.beginPath(); parts(); ctx.save(); ctx.clip();
+      const g = ctx.createLinearGradient(0, -4.4, 0, 4.2);         // 背中の濃い茶 → 脇腹 → 白っぽい腹
+      g.addColorStop(0, c.backDark); g.addColorStop(0.3, c.back); g.addColorStop(0.62, c.flank); g.addColorStop(0.84, c.belly);
+      ctx.fillStyle = g; ctx.fillRect(-12, -8, 24, 14);
+      ctx.strokeStyle = "rgba(70,48,30,0.35)"; ctx.lineWidth = 0.5;  // もものふくらみ（大きな後ろ足）
+      ctx.beginPath(); ctx.arc(hx + 0.4, 0.6, 2.9, Math.PI * 0.55, Math.PI * 1.45); ctx.stroke();
+      ctx.fillStyle = "rgba(60,40,25,0.35)";                          // 毛のまだら（背中の細かい点）
+      for (let i = 0; i < 9; i++) {
+        const u = rnd(s.seed || 0, i);
+        ctx.fillRect(lerp(hx - 2, cx + 1, u) , -3.4 + rnd(s.seed || 0, i + 20) * 2.2, 0.5, 0.4);
+      }
+      ctx.restore();
+      ctx.restore();
+
+      // 3. 手前の後ろ足・前足
+      limb(ctx, [fn.H, fn.T], 1.25, c.flank);
+      ctx.fillStyle = c.belly; ctx.beginPath(); ell(ctx, fn.T.x, fn.T.y, 0.7, 0.4); ctx.fill();    // つま先の白っぽい毛
+      limb(ctx, pawAt(p.foreN, 0), 1.05, c.flank);
+
+      // 4. 頭（ほお・目・鼻）
+      ctx.save(); ctx.translate(head.x, head.y); ctx.rotate(hr);
+      ctx.beginPath(); ell(ctx, 0, 0, 3.0, 2.5, 0); ell(ctx, 1.7, 0.6, 1.5, 1.4, 0);
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      ctx.beginPath(); ell(ctx, 0, 0, 3.0, 2.5, 0); ell(ctx, 1.7, 0.6, 1.5, 1.4, 0);
+      ctx.save(); ctx.clip();
+      const gh = ctx.createLinearGradient(0, -2.6, 0, 2.4);
+      gh.addColorStop(0, c.back); gh.addColorStop(0.55, c.flank); gh.addColorStop(1, c.belly);
+      ctx.fillStyle = gh; ctx.fillRect(-4, -3, 8, 6);
+      ctx.restore();
+      eye(ctx, 0.7, -0.5, 0.75, c, p.blink);
+      ctx.fillStyle = c.nose; ctx.beginPath(); ell(ctx, 3.0, 0.5 + p.nose, 0.45, 0.35); ctx.fill();
+      ear(ctx, -0.6, -1.7, -0.12 - p.ear * 1.1, 6.2, 1.6, c.back, c, true);
+      ctx.restore();
+
+      // 5. しっぽ（白い丸）
+      const tp = W(hx - 4.0, -1.4);
+      ctx.beginPath(); ell(ctx, tp.x, tp.y, 1.35, 1.25);
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = c.tail; ctx.fill();
+    }
+
+    // 正面（こちらへ向かう）と後ろ（向こうへ行く）
+    function drawFrontBack(ctx, s, c, back) {
+      const p = pose(s);
+      const lift = p.lift, sy = 1 + (p.s - 0.4) * 0.12 + p.sitUp * 0.12;   // 縦の伸び縮み
+      const by = -4.2 - lift;
+      // 後ろ足（地面の上の足。跳んでいる間は浮く）
+      const hfY = Math.min(-0.5, -0.5 - lift + p.hind * 2.5);
+      ctx.save();
+      [-1, 1].forEach(function (d) {
+        ctx.beginPath(); ell(ctx, d * 2.7, hfY, 1.5, back ? 1.0 : 0.75);
+        ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+        ctx.fillStyle = back ? c.belly : c.flank; ctx.fill();
+      });
+      ctx.restore();
+      // 胴（大きく丸いおしりと胸）
+      ctx.save(); ctx.translate(0, by); ctx.scale(1, sy);
+      const body = function () { ell(ctx, 0, 0.2, 4.3, 4.0); ctx.moveTo(3, -1.2); ell(ctx, 0, -1.2, 3.0, 3.0); };
+      ctx.beginPath(); body(); ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      ctx.beginPath(); body(); ctx.save(); ctx.clip();
+      const g = ctx.createLinearGradient(0, -4.2, 0, 4.2);
+      g.addColorStop(0, c.backDark); g.addColorStop(0.4, c.back); g.addColorStop(1, c.flank);
+      ctx.fillStyle = g; ctx.fillRect(-6, -6, 12, 12);
+      if (!back) {                                                        // 胸と腹の白っぽい毛
+        ctx.fillStyle = c.belly; ctx.beginPath(); ell(ctx, 0, 1.0, 2.2, 3.0); ctx.fill();
+      } else {
+        ctx.fillStyle = "rgba(90,62,40,0.35)"; ctx.fillRect(-0.4, -4.2, 0.8, 4.0);   // 背骨の筋
+      }
+      ctx.restore();
+      ctx.restore();
+      // 前足（正面だけ見える。歩くときは片方ずつ）
+      if (!back) {
+        [-1, 1].forEach(function (d) {
+          const f = d < 0 ? p.foreN : p.foreF;
+          const py = Math.min(-0.4, -0.4 - lift * 0.6 - Math.max(0, f) * 0.8);
+          limb(ctx, [{ x: d * 1.1, y: by + 2.4 }, { x: d * 1.15, y: py }], 0.9, c.flank);
+        });
+      } else {
+        // しっぽ（後ろから大きく見える白い丸）
+        ctx.beginPath(); ell(ctx, 0, by + 2.0 * sy, 1.7, 1.5);
+        ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = c.tail; ctx.fill();
+      }
+      // 頭と耳
+      const hy = by - 4.9 * sy - p.sitUp * 0.6;
+      const earLen = 6.2 * (1 - p.ear * 0.55);                          // 後ろへ倒すほど短く見える
+      const spread = 0.12 + p.ear * 0.1;
+      if (!back) {
+        ear(ctx, -1.0, hy - 1.6, -spread, earLen, 1.6, c.back, c, true);
+        ear(ctx, 1.0, hy - 1.6, spread, earLen, 1.6, c.back, c, true);
+      }
+      ctx.beginPath(); ell(ctx, 0, hy, 2.8, 2.5); ell(ctx, 0, hy + 1.0, 2.4, 1.8);
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      ctx.beginPath(); ell(ctx, 0, hy, 2.8, 2.5); ell(ctx, 0, hy + 1.0, 2.4, 1.8);
+      ctx.save(); ctx.clip();
+      const gh = ctx.createLinearGradient(0, hy - 2.6, 0, hy + 2.8);
+      gh.addColorStop(0, back ? c.backDark : c.back); gh.addColorStop(0.6, back ? c.back : c.flank); gh.addColorStop(1, back ? c.flank : c.belly);
+      ctx.fillStyle = gh; ctx.fillRect(-4, hy - 3, 8, 7);
+      ctx.restore();
+      if (!back) {
+        eye(ctx, -1.75, hy - 0.4, 0.62, c, p.blink); eye(ctx, 1.75, hy - 0.4, 0.62, c, p.blink);
+        ctx.fillStyle = c.belly; ctx.beginPath(); ell(ctx, 0, hy + 1.3, 1.1, 0.8); ctx.fill();   // 口もと
+        ctx.fillStyle = c.nose; ctx.beginPath(); ell(ctx, 0, hy + 0.8 + p.nose * 0.6, 0.45, 0.32); ctx.fill();
+      } else {
+        ear(ctx, -1.0, hy - 1.4, -spread, earLen, 1.6, c.back, c, false);
+        ear(ctx, 1.0, hy - 1.4, spread, earLen, 1.6, c.back, c, false);
+      }
+    }
+
+    return {
+      size: { w: 19, h: 17 },          // 横向き・止まっているとき（しっぽ〜鼻先 約19px、耳の先まで 約17px）
+      states: ["idle", "walk", "hop", "alert"],
+      draw: function (ctx, s) {
+        LW = outlineW(ctx);
+        const c = palette(s.seed || 0);
+        ctx.save();
+        if (s.view === "front") drawFrontBack(ctx, s, c, false);
+        else if (s.view === "back") drawFrontBack(ctx, s, c, true);
+        else drawSide(ctx, s, c);
+        ctx.restore();
+      }
+    };
+  })();
+
+  // アヒル（白い家鴨）。状態：idle／walk／swim／dabble
+  //   swim・dabble のときは、原点＝水面の中心。水面より下は絵の側で切る（うすく水の中の体と足だけ見せる）。波紋も絵の側で描く。
+  ANIMAL_ART.duck = (function () {
+    const OL = "rgba(40,30,20,0.55)";
+    let LW = 0.8;                        // 組み込みで変更：draw のはじめに画面上の倍率で決め直す
+    // 組み込みで追加：輪郭の太さを画面上の倍率に合わせる（柴犬・猫と同じ決め方。倍率1で0.8、拡大したときだけ √倍率 で少し太く）
+    function outlineW(ctx) {
+      const m = ctx.getTransform();
+      const sc = Math.max(0.01, Math.hypot(m.a, m.b));
+      return (sc <= 1 ? 0.8 : 0.8 * Math.sqrt(sc)) / sc;
+    }
+    const C = {
+      top: "#fffefa", mid: "#f6f2e8", under: "#d8dde5",      // 白い羽（上・横・陰になる腹）
+      wingLine: "rgba(120,118,128,0.5)",
+      bill: "#f29a2e", billDark: "#d97a18", nail: "#f6c27a",
+      leg: "#f08b26", legFar: "#cf6f17",
+      eye: "#1f1a16", water: "rgba(255,255,255,0.75)", deep: "rgba(40,90,140,0.25)"
+    };
+
+    function lerp(a, b, u) { return a + (b - a) * u; }
+    function smooth(u) { return u * u * (3 - 2 * u); }
+    function ell(ctx, x, y, rx, ry, rot) { const r = rot || 0; ctx.moveTo(x + Math.max(rx, 0.01) * Math.cos(r), y + Math.max(rx, 0.01) * Math.sin(r)); ctx.ellipse(x, y, Math.max(rx, 0.01), Math.max(ry, 0.01), r, 0, Math.PI * 2); }
+
+    // 水かきのある足（横から）。x,y＝かかと、lift＝足を上げる量、col＝色
+    function footSide(ctx, x, y, lift, col) {
+      ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(x, y - 3.2); ctx.lineTo(x, y - lift);
+      ctx.strokeStyle = OL; ctx.lineWidth = 1.0 + LW * 2; ctx.stroke();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.0; ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - 0.6, y - lift); ctx.lineTo(x + 2.6, y - lift - 0.1 + lift * 0.3); ctx.lineTo(x + 2.2, y - lift - 0.9); ctx.closePath();
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke();
+      ctx.fillStyle = col; ctx.fill();
+    }
+
+    // 横向きの体（首・頭・体・しっぽを1つの形として描く）。o＝姿勢
+    function bodySide(ctx, o, seed) {
+      const hx = o.hx, hy = o.hy;                       // 頭の中心
+      const shapes = function (forStroke) {
+        ctx.beginPath();
+        ell(ctx, -0.6, -6.0, 6.8, 3.9, -0.16);          // 体
+        ctx.moveTo(5.2, -6.4); ell(ctx, 2.2, -6.4, 3.4, 3.7, 0);   // ふっくらした胸
+        ctx.moveTo(-5.0, -8.0);                         // しっぽ（少し上を向いてとがる）
+        ctx.lineTo(-8.6 - o.tail * 0.3, -9.6 + o.tail * 0.4); ctx.lineTo(-6.0, -5.6); ctx.closePath();
+        ctx.moveTo(hx + 2.6, hy); ell(ctx, hx, hy, 2.6, 2.3, 0);   // 頭
+        if (forStroke) { ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke(); }
+      };
+      const neck = function (w, col) {                  // 首（太い線）
+        ctx.lineCap = "round";
+        ctx.beginPath(); ctx.moveTo(2.6, -7.6); ctx.quadraticCurveTo(3.2 + (hx - 5) * 0.3, (hy - 7.6) * 0.5 - 3.5, hx - 0.4, hy + 0.8);
+        ctx.strokeStyle = col; ctx.lineWidth = w; ctx.stroke();
+      };
+      neck(3.4 + LW * 2, OL); shapes(true);             // 先に輪郭だけ描き、上から中を塗る（つなぎ目に線が出ない）
+      shapes(false); ctx.fillStyle = C.mid; ctx.fill();
+      neck(3.4, C.mid);
+      // 体の陰（上が明るく、腹側がうすい灰色）
+      ctx.save();
+      ctx.beginPath(); ell(ctx, -0.6, -6.0, 6.8, 3.9, -0.16); ctx.moveTo(5.2, -6.4); ell(ctx, 2.2, -6.4, 3.4, 3.7, 0); ctx.clip();
+      const g = ctx.createLinearGradient(0, -10.2, 0, -2.0);
+      g.addColorStop(0, C.top); g.addColorStop(0.5, C.mid); g.addColorStop(1, C.under);
+      ctx.fillStyle = g; ctx.fillRect(-9, -11, 18, 10);
+      ctx.restore();
+      // つばさ（うすい線で輪郭と羽の重なり）
+      ctx.strokeStyle = C.wingLine; ctx.lineWidth = 0.55;
+      ctx.beginPath(); ctx.moveTo(3.4, -7.6); ctx.quadraticCurveTo(-1.0, -9.4, -6.2, -8.2);
+      ctx.quadraticCurveTo(-3.0, -4.6, 2.2, -5.4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-1.0, -6.0); ctx.lineTo(-5.4, -7.6); ctx.moveTo(-0.2, -6.9); ctx.lineTo(-4.4, -8.2); ctx.stroke();
+      // 雄の巻き毛（個体によって）
+      if (seed > 0.5) {
+        ctx.beginPath(); ctx.arc(-7.4, -10.0, 0.8, Math.PI * 0.2, Math.PI * 1.5); ctx.stroke();
+      }
+      // 頭の陰
+      ctx.save(); ctx.beginPath(); ell(ctx, hx, hy, 2.6, 2.3, 0); ctx.clip();
+      const gh = ctx.createLinearGradient(0, hy - 2.4, 0, hy + 2.4);
+      gh.addColorStop(0, C.top); gh.addColorStop(1, "#e8e9ec");
+      ctx.fillStyle = gh; ctx.fillRect(hx - 3, hy - 3, 6, 6);
+      ctx.restore();
+      // くちばし（平たく、先に爪）
+      ctx.beginPath();
+      ctx.moveTo(hx + 1.6, hy - 0.6); ctx.quadraticCurveTo(hx + 3.8, hy - 0.4, hx + 5.0, hy + 0.3);
+      ctx.quadraticCurveTo(hx + 5.0, hy + 1.0, hx + 4.2, hy + 1.0); ctx.lineTo(hx + 1.8, hy + 1.0); ctx.closePath();
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke();
+      ctx.fillStyle = C.bill; ctx.fill();
+      ctx.strokeStyle = C.billDark; ctx.lineWidth = 0.4;
+      ctx.beginPath(); ctx.moveTo(hx + 2.0, hy + 0.55); ctx.lineTo(hx + 4.6, hy + 0.6); ctx.stroke();   // くちばしの合わせ目
+      ctx.fillStyle = C.nail; ctx.beginPath(); ell(ctx, hx + 4.6, hy + 0.35, 0.4, 0.3); ctx.fill();
+      // 目
+      ctx.fillStyle = C.eye; ctx.beginPath(); ell(ctx, hx + 0.6, hy - 0.6, 0.55, o.blink ? 0.1 : 0.55); ctx.fill();
+      if (!o.blink) { ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.beginPath(); ell(ctx, hx + 0.45, hy - 0.8, 0.2, 0.2); ctx.fill(); }
+    }
+
+    // 正面・後ろの体
+    function bodyFB(ctx, o, back) {
+      const hx = o.hx, hy = o.hy;
+      const shapes = function () {
+        ctx.beginPath();
+        ell(ctx, 0, -5.3, 5.0, 4.3, 0);                 // 体（正面は胸、後ろはおしり。下がふくらんだ洋なし形）
+        ell(ctx, 0, -7.6, 3.5, 3.0, 0);                 // 肩
+        ell(ctx, 0, -9.9, 1.9, 2.0, 0);                 // 首
+        ell(ctx, hx, hy, 2.25, 2.2, 0);                 // 頭
+      };
+      shapes(); ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+      shapes(); ctx.fillStyle = C.mid; ctx.fill();
+      ctx.save(); ctx.beginPath(); ell(ctx, 0, -5.3, 5.0, 4.3, 0); ell(ctx, 0, -7.6, 3.5, 3.0, 0); ctx.clip();
+      const g = ctx.createLinearGradient(0, -10.6, 0, -1.0);
+      g.addColorStop(0, C.top); g.addColorStop(0.55, C.mid); g.addColorStop(1, C.under);
+      ctx.fillStyle = g; ctx.fillRect(-6, -11, 12, 10);
+      ctx.strokeStyle = C.wingLine; ctx.lineWidth = 0.55;              // 両わきのつばさの線
+      if (!back) {
+        ctx.beginPath(); ctx.moveTo(-3.4, -8.8); ctx.quadraticCurveTo(-2.6, -5.0, -3.8, -2.4);
+        ctx.moveTo(3.4, -8.8); ctx.quadraticCurveTo(2.6, -5.0, 3.8, -2.4); ctx.stroke();
+      } else {                                                         // 後ろ：たたんだつばさの先が腰の上で重なる
+        ctx.beginPath(); ctx.moveTo(-3.6, -8.6); ctx.quadraticCurveTo(-1.6, -5.6, -0.3, -3.0);
+        ctx.moveTo(3.6, -8.6); ctx.quadraticCurveTo(1.6, -5.6, 0.3, -3.0); ctx.stroke();
+      }
+      ctx.restore();
+      ctx.save(); ctx.beginPath(); ell(ctx, hx, hy, 2.25, 2.2, 0); ctx.clip();
+      const gh = ctx.createLinearGradient(0, hy - 2.4, 0, hy + 2.4);
+      gh.addColorStop(0, C.top); gh.addColorStop(1, "#e6e8ec");
+      ctx.fillStyle = gh; ctx.fillRect(hx - 3, hy - 3, 6, 6);
+      ctx.restore();
+      if (!back) {
+        // くちばし（こちらを向いて、手前に平たくのびる）
+        ctx.beginPath();
+        ctx.moveTo(hx - 1.2, hy + 0.1); ctx.quadraticCurveTo(hx, hy - 0.5, hx + 1.2, hy + 0.1);
+        ctx.quadraticCurveTo(hx + 1.6, hy + 1.9, hx, hy + 2.3); ctx.quadraticCurveTo(hx - 1.6, hy + 1.9, hx - 1.2, hy + 0.1);
+        ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = C.bill; ctx.fill();
+        ctx.fillStyle = C.billDark; ctx.fillRect(hx - 0.5, hy + 0.5, 0.25, 0.3); ctx.fillRect(hx + 0.25, hy + 0.5, 0.25, 0.3);   // 鼻の穴
+        ctx.fillStyle = C.eye;
+        [-1, 1].forEach(function (d) { ctx.beginPath(); ell(ctx, hx + d * 1.6, hy - 0.7, 0.42, o.blink ? 0.08 : 0.45); ctx.fill(); });
+      } else {
+        // しっぽ（腰の上にとがって立つ。頭と重なるので、うすい線で形だけ見せる）
+        ctx.beginPath(); ctx.moveTo(-1.5, -8.0); ctx.lineTo(o.tail * 0.4, -10.4); ctx.lineTo(1.5, -8.0);
+        ctx.fillStyle = C.top; ctx.fill(); ctx.strokeStyle = C.wingLine; ctx.lineWidth = 0.6; ctx.stroke();
+        // 雄はしっぽの先が巻く
+        if (o.curl) {
+          ctx.strokeStyle = C.wingLine; ctx.lineWidth = 0.55;
+          ctx.beginPath(); ctx.arc(o.tail * 0.4, -10.9, 0.55, Math.PI * 0.6, Math.PI * 2.0); ctx.stroke();
+        }
+      }
+    }
+
+    // 水かき（正面・後ろ）
+    function footFB(ctx, x, lift, col, back) {
+      ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(x, -3.0); ctx.lineTo(x, -0.6 - lift);
+      ctx.strokeStyle = OL; ctx.lineWidth = 1.0 + LW * 2; ctx.stroke(); ctx.strokeStyle = col; ctx.lineWidth = 1.0; ctx.stroke();
+      ctx.beginPath();
+      if (back) { ell(ctx, x, -0.5 - lift, 1.2, 0.5, 0); }
+      else { ctx.moveTo(x, -0.8 - lift); ctx.lineTo(x + 1.5, -0.1 - lift); ctx.lineTo(x - 1.5, -0.1 - lift); ctx.closePath(); }
+      ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = col; ctx.fill();
+    }
+
+    // 水面の波紋。half＝"back"（奥の半分。体より先に描く）／"front"（手前の半分）
+    function ripples(ctx, s, half, strong) {
+      const t = s.t || 0, sd = s.seed || 0;
+      const a0 = half === "back" ? Math.PI : 0, a1 = a0 + Math.PI;
+      ctx.lineWidth = 0.6;
+      for (let i = 0; i < 2; i++) {
+        const u = ((t * 0.45 + i * 0.5 + sd) % 1 + 1) % 1;
+        const rx = 7.5 + u * 6.5;
+        ctx.strokeStyle = "rgba(255,255,255," + ((1 - u) * (strong ? 0.7 : 0.45)).toFixed(3) + ")";
+        ctx.beginPath(); ctx.ellipse(0, 0, rx, rx * 0.3, 0, a0, a1); ctx.stroke();
+      }
+      ctx.strokeStyle = C.water; ctx.lineWidth = 0.8;                 // 体のまわりの水ぎわの光
+      ctx.beginPath(); ctx.ellipse(0, 0, 7.0, 1.9, 0, a0, a1); ctx.stroke();
+    }
+
+    // 水面より上だけ描く／水の中をうすく描く
+    function aboveWater(ctx, fn) { ctx.save(); ctx.beginPath(); ctx.rect(-40, -60, 80, 60); ctx.clip(); fn(); ctx.restore(); }
+    function underWater(ctx, fn) { ctx.save(); ctx.beginPath(); ctx.rect(-40, 0, 80, 20); ctx.clip(); ctx.globalAlpha = 0.18; fn(); ctx.restore(); }
+
+    // 状態ごとの姿勢
+    function pose(s) {
+      const t = s.t || 0, ph = s.phase || 0, sd = s.seed || 0, P2 = Math.PI * 2;
+      const o = { hx: 5.4, hy: -12.6, rot: 0, bob: 0, tail: 0, legA: 0, legB: 0, liftA: 0, liftB: 0, tip: 0, curl: sd > 0.5 };
+      o.blink = ((t + sd * 5) % 3.7) < 0.11;
+      if (s.state === "walk") {
+        // よちよち：体を左右にゆすり、足を交互に出す
+        const a = Math.sin(ph * P2);
+        o.rot = 0.07 * a; o.bob = -Math.abs(Math.cos(ph * P2)) * 0.5;
+        o.legA = 1.6 * a; o.legB = -1.6 * a;
+        o.liftA = Math.max(0, Math.cos(ph * P2)) * 1.0; o.liftB = Math.max(0, -Math.cos(ph * P2)) * 1.0;
+        o.hx = 5.6 + 0.4 * Math.cos(ph * P2 * 2); o.hy = -12.5;       // 歩くたびに首が前後に動く
+        o.tail = 0.6 * a;
+      } else if (s.state === "swim") {
+        // 水に浮いて、水の中で足だけ交互にこぐ
+        o.bob = Math.sin(t * 2.0 + sd * 6) * 0.25;
+        o.legA = 1.8 * Math.sin(ph * P2); o.legB = -o.legA;
+        o.hx = 5.0 + 0.3 * Math.sin(t * 0.7 + sd * 3); o.hy = -12.8;
+        o.tail = 0.3 * Math.sin(t * 1.5);
+      } else if (s.state === "dabble") {
+        // 頭を水に入れておしりを上げる：入る → しばらく逆立ち（足をばたばた）→ 戻る
+        const u = ((ph % 1) + 1) % 1;
+        o.tip = u < 0.18 ? smooth(u / 0.18) : (u < 0.8 ? 1 : 1 - smooth((u - 0.8) / 0.2));
+        o.legA = 1.5 * Math.sin(t * 9); o.legB = -o.legA;
+        o.tail = 0.6 * Math.sin(t * 6);
+      } else {
+        // idle：首を少しかしげる・しっぽを振る
+        o.hx = 5.3 + 0.35 * Math.sin(t * 0.8 + sd * 4); o.hy = -12.7 + 0.2 * Math.sin(t * 1.1);
+        o.tail = Math.max(0, Math.sin(t * 5 + sd * 9)) * (((t + sd * 3) % 5) < 0.7 ? 1 : 0);
+      }
+      return o;
+    }
+
+    // 横向き
+    function drawSide(ctx, s) {
+      const o = pose(s), water = s.state === "swim" || s.state === "dabble";
+      if (!water) {
+        footSide(ctx, -1.6 + o.legB, 0, o.liftB, C.legFar);          // 向こう側の足
+        ctx.save(); ctx.translate(0, o.bob); ctx.rotate(o.rot);
+        bodySide(ctx, o, s.seed || 0);
+        ctx.restore();
+        footSide(ctx, -0.8 + o.legA, 0, o.liftA, C.leg);              // 手前の足
+        return;
+      }
+      // 水の上：体を水面まで沈める（体の下 −2.2 が水面より下）。dabble は胸の前を中心に前へ倒す
+      const sink = 5.0 + o.tip * 5.5;                                // 逆立ちのときは、さらに深く沈む（後ろ半分だけが水面に出る）
+      const ang = o.tip * 1.2;
+      // 体の中の点 → 絵の点（胸の前 (3.0, −5.6) を中心に前へ倒す）
+      const at = function (x, y) {
+        const dx = x - 3.0, dy = y + 5.6, c = Math.cos(ang), n = Math.sin(ang);
+        return { x: 3.0 + dx * c - dy * n, y: -5.6 + dx * n + dy * c + sink + o.bob };
+      };
+      const body = function () {
+        ctx.save(); ctx.translate(0, sink + o.bob);
+        if (ang > 0) { ctx.translate(3.0, -5.6); ctx.rotate(ang); ctx.translate(-3.0, 5.6); }
+        bodySide(ctx, o, s.seed || 0);
+        ctx.restore();
+      };
+      const feet = function () {
+        if (o.tip < 0.5) {
+          footSide(ctx, -1.6 + o.legB, sink, 0, C.legFar); footSide(ctx, -0.8 + o.legA, sink, 0, C.leg);
+          return;
+        }
+        // 逆立ちの間は、腰の後ろで足が水面をばたばたける
+        const hip = at(-1.6, -2.6);
+        [[o.legA, C.leg], [o.legB, C.legFar]].forEach(function (f) {
+          const x = hip.x - 1.2 + f[0] * 0.7, y = Math.min(hip.y, 0.4) - 0.3 - Math.max(0, f[0]) * 0.3;
+          ctx.beginPath(); ell(ctx, x, y, 1.3, 0.55, -0.4 + f[0] * 0.2);
+          ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = f[1]; ctx.fill();
+        });
+      };
+      const splash = o.tip > 0.05 && o.tip < 0.95;
+      // 水の中の体はうすく（逆立ちのときは描かない）。確かめ後の手直し：水の中の足は描かない（灰色の棒に見えて、水の上に立っているように見えたため）
+      underWater(ctx, function () { if (o.tip < 0.5) body(); });
+      ripples(ctx, s, "back", splash);
+      aboveWater(ctx, function () { body(); });
+      if (o.tip >= 0.5) feet();
+      ripples(ctx, s, "front", splash);
+    }
+
+    // 正面・後ろ
+    function drawFrontBack(ctx, s, back) {
+      const o = pose(s), water = s.state === "swim" || s.state === "dabble";
+      o.hx = 0; o.hy = -12.2 + (s.state === "idle" ? 0.2 * Math.sin((s.t || 0) * 1.1) : 0);
+      const bodyAt = function () {
+        ctx.save(); ctx.translate(0, o.bob);
+        ctx.translate(0, 0); ctx.rotate(o.rot * 1.2);                // よちよち（左右にゆれる）
+        bodyFB(ctx, o, back);
+        ctx.restore();
+      };
+      if (!water) {
+        footFB(ctx, -1.6, o.liftB, back ? C.leg : C.legFar, back);
+        footFB(ctx, 1.6, o.liftA, back ? C.legFar : C.leg, back);
+        bodyAt();
+        return;
+      }
+      const sink = 5.0;
+      if (o.tip > 0.3) {
+        // 逆立ち：水面から体の後ろ半分としっぽだけが出る（後ろからは足のばたばたも見える）
+        const h = 2.0 + o.tip * 3.2;
+        ripples(ctx, s, "back", o.tip < 0.95);
+        aboveWater(ctx, function () {
+          ctx.beginPath(); ell(ctx, 0, 0.6, 3.6, h, 0); ctx.moveTo(1.0, -h + 0.8); ctx.lineTo(0, -h - 1.6 - o.tail * 0.3); ctx.lineTo(-1.0, -h + 0.8); ctx.closePath();
+          ctx.strokeStyle = OL; ctx.lineWidth = LW * 2; ctx.stroke();
+          ctx.fillStyle = C.mid; ctx.fill();
+          const g = ctx.createLinearGradient(0, -h, 0, 0.6);
+          g.addColorStop(0, C.top); g.addColorStop(1, back ? C.under : C.mid);
+          ctx.save(); ctx.beginPath(); ell(ctx, 0, 0.6, 3.6, h, 0); ctx.clip(); ctx.fillStyle = g; ctx.fillRect(-4, -h - 1, 8, h + 2);
+          if (!back) { ctx.strokeStyle = C.wingLine; ctx.lineWidth = 0.55; ctx.beginPath(); ctx.moveTo(-2.6, 0); ctx.quadraticCurveTo(-1.8, -h * 0.5, 0, -h + 0.6); ctx.moveTo(2.6, 0); ctx.quadraticCurveTo(1.8, -h * 0.5, 0, -h + 0.6); ctx.stroke(); }
+          ctx.restore();
+          if (back) {                                                // 足のばたばた
+            [-1, 1].forEach(function (d, i) {
+              const k = i ? o.legA : o.legB;
+              ctx.beginPath(); ell(ctx, d * (2.4 + k * 0.4), -0.5 - Math.abs(k) * 0.3, 1.0, 0.55, d * 0.5);
+              ctx.strokeStyle = OL; ctx.lineWidth = LW * 1.6; ctx.stroke(); ctx.fillStyle = C.leg; ctx.fill();
+            });
+          }
+        });
+        ripples(ctx, s, "front", o.tip < 0.95);
+        return;
+      }
+      const body = function () {
+        ctx.save(); ctx.translate(0, sink + o.bob + o.tip * 3); bodyFB(ctx, o, back); ctx.restore();
+      };
+      // 確かめ後の手直し：水の中の足は描かない（横向きと同じ理由）。水の中の体だけ、うすく描く
+      underWater(ctx, body);
+      ripples(ctx, s, "back", false);
+      aboveWater(ctx, body);
+      ripples(ctx, s, "front", false);
+    }
+
+    return {
+      size: { w: 19, h: 15 },          // 横向き・陸で立つとき（しっぽ〜くちばしの先 約19px、頭の上まで 約15px）
+      states: ["idle", "walk", "swim", "dabble"],
+      draw: function (ctx, s) {
+        LW = outlineW(ctx);
+        // 組み込みで追加：アヒルは陸に上がらない。仕組みの側の idle（水に浮いて止まっている）・walk も、水の上の姿（swim）で描く
+        if (s.state !== "swim" && s.state !== "dabble") s = Object.assign({}, s, { state: "swim" });
+        ctx.save();
+        if (s.view === "front") drawFrontBack(ctx, s, false);
+        else if (s.view === "back") drawFrontBack(ctx, s, true);
+        else drawSide(ctx, s);
+        ctx.restore();
+      }
+    };
+  })();
+  // ============================================================
+  // ★動物の絵（ここまで）
+  // ============================================================
+
+  // 絵に無い状態を頼まれたときの置き換え（左の状態が無ければ、右の状態で描く。順にたどる）
+  const ANIMAL_STATE_FALLBACK = {
+    run: "walk", hop: "walk", swim: "walk", fly: "walk", flutter: "walk",
+    groom: "sit", sit: "idle", wag: "idle", alert: "idle", peck: "idle", dabble: "idle", walk: "idle"
+  };
+  function animalArtState(art, st) {
+    const list = art.states || [];
+    let s = st;
+    for (let n = 0; n < 4 && list.indexOf(s) < 0 && ANIMAL_STATE_FALLBACK[s]; n++) s = ANIMAL_STATE_FALLBACK[s];
+    return s;
+  }
+
+  // 種類ごとの動きの値。速さはマス／秒（1マス＝約1.15m：主人公の高さ1.4マス≒1.6m）。
+  //   walk＝ふだんの速さ、run＝逃げる・走る速さ、stride＝1周期で進む長さ（足の運びの速さを決める）、
+  //   step＝ふだん1回に動く長さの上限、margin＝体の幅の半分（通れない所へはみ出さない余白）、turn＝向きを変える速さ（ラジアン／秒）、
+  //   react＝反応する距離（マス）
+  //   runStride＝走るときの1周期で進む長さ（無ければ stride の1.8倍）。
+  //   組み込みで変更：柴犬・猫の stride・runStride は、絵の足の運び（1周期で足先が地面を後ろへ送る長さ＝2×ふり幅÷地面に着いている割合）に
+  //   合わせた（足が地面をすべって見えないように）。柴犬 歩く 7.4px・走る 17.6px、猫 歩く 5.0px・走る 13.3px（45px＝1マス）
+  //   確かめ後の手直し：足が1秒に6〜10回も回って小走りに見えたので、絵の歩幅を広げ（柴犬 歩く 11.6px・走る 25px、猫 歩く 8.0px・走る 21.1px）、
+  //   速さを散歩・小走りの速さに下げた（柴犬 歩く 0.95→0.65・走る 3.2→2.6、猫 歩く 0.75→0.45・走る 2.9→2.2）。
+  //   足の周期は1秒に 柴犬 歩く約2.5回・走る約4.7回、猫 歩く約2.5回・走る約4.7回
+  const ANIMAL_KIND = {
+    sparrow:   { walk: 0.5, run: 0, fly: 3.6, stride: 0.12, step: 0.8, margin: 0.05, turn: 10, react: 2.5, variants: ["suzume"] },
+    shiba:     { walk: 0.65, run: 2.6, stride: 0.258, runStride: 0.556, step: 5, margin: 0.14, turn: 3.5, react: 3, variants: ["aka"] },
+    cat:       { walk: 0.45, run: 2.2, stride: 0.178, runStride: 0.468, step: 3, margin: 0.12, turn: 4.5, react: 2, variants: ["chatora", "mike", "hachiware"] },
+    butterfly: { walk: 0.7, run: 1.1, stride: 0.5, step: 2.2, margin: 0.05, turn: 3, react: 2, variants: ["monshiro", "ageha"] },
+    rabbit:    { walk: 1.1, run: 3.3, stride: 0.45, step: 2.5, margin: 0.1, turn: 6, react: 3, variants: ["nousagi"] },
+    duck:      { walk: 0.32, run: 0.8, stride: 0.22, step: 4, margin: 0.2, turn: 2.2, react: 1.3, variants: ["ahiru"] }
+  };
+  // config.js に種類の書き込みが無いときの数と場所
+  const ANIMAL_DEFAULT = {
+    sparrow: { count: 6, place: "plaza" }, shiba: { count: 2, place: "road" }, cat: { count: 3, place: "town" },
+    butterfly: { count: 4, place: "flower" }, rabbit: { count: 2, place: "woods" }, duck: { count: 3, place: "pond" }
+  };
+  const ANC = C.animals || {};
+
+  // 決まった種（seed）から作る乱数（0〜1）。同じ種なら毎回同じ並びになる
+  function makeRand(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function rndIn(r, lo, hi) { return lo + (hi - lo) * r(); }
+
+  // まわり（半径 n マスの四角）に、その文字のマスがいくつあるか
+  function countTileNear(x, y, ch, n) {
+    let k = 0;
+    for (let dy = -n; dy <= n; dy++) for (let dx = -n; dx <= n; dx++) if (tileAt(x + dx, y + dy) === ch) k++;
+    return k;
+  }
+  // まわり（半径 n マスの四角）に、建物があるか
+  function buildingNear(x, y, n) {
+    for (let dy = -n; dy <= n; dy++) for (let dx = -n; dx <= n; dx++) if (buildingAt(x + dx, y + dy)) return true;
+    return false;
+  }
+
+  // そのマスが、place（いる場所）に当てはまるか
+  function animalCellFits(place, x, y) {
+    const t = tileAt(x, y);
+    if (place === "pond") return t === T.POND;
+    if (!isWalkable(x, y)) return false;
+    if (place === "road") return t === T.ROAD;
+    if (place === "plaza") return Math.hypot(x - C.start.x, y - C.start.y) <= 5.5;
+    if (place === "town") return t === T.ROAD || buildingNear(x, y, 1);
+    if (place === "flower") return countTileNear(x, y, T.FLOWER, 1) > 0;
+    if (place === "woods") return t !== T.ROAD && countTileNear(x, y, T.TREE, 1) >= 2;
+    return true;
+  }
+
+  // その位置（マスの中の小数の位置）に、その動物の体が収まるか（四すみで調べる）
+  function animalOk(a, x, y) {
+    const m = ANIMAL_KIND[a.kind].margin;
+    const at = function (px, py) {
+      const tx = Math.floor(px), ty = Math.floor(py);
+      if (a.kind === "duck") return a.pond.has(ty * COLS + tx);                   // アヒル：自分の池の上だけ
+      if (a.kind === "butterfly") {                                               // ちょうちょ：木と建物の中には入らない（池や道の上は飛べる）
+        const t = tileAt(tx, ty);
+        return t !== null && t !== T.TREE && !buildingAt(tx, ty);
+      }
+      return isWalkable(tx, ty);
+    };
+    return at(x - m, y - m) && at(x + m, y - m) && at(x - m, y + m) && at(x + m, y + m);
+  }
+
+  // まっすぐ進む線の上が、ずっと収まるか
+  function animalLineOk(a, x0, y0, x1, y1) {
+    const d = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(d / 0.12));
+    for (let i = 1; i <= n; i++) if (!animalOk(a, lerp(x0, x1, i / n), lerp(y0, y1, i / n))) return false;
+    return true;
+  }
+
+  // 池のつながり（"~" のマスを上下左右でたどった、ひとまとまり）。マスの番号（y*COLS+x）の集まり
+  function pondGroup(x, y) {
+    const set = new Set(), todo = [[x, y]];
+    while (todo.length) {
+      const p = todo.pop(), k = p[1] * COLS + p[0];
+      if (set.has(k) || tileAt(p[0], p[1]) !== T.POND) continue;
+      set.add(k);
+      todo.push([p[0] + 1, p[1]], [p[0] - 1, p[1]], [p[0], p[1] + 1], [p[0], p[1] - 1]);
+    }
+    return set;
+  }
+
+  // 動物と群れの一覧（animals.enabled が false なら空のまま）
+  const animals = [];
+  const animalFlocks = [];
+
+  // config.js の animals から、決まった種の乱数で動物を置く
+  function createAnimals() {
+    if (ANC.enabled !== true) return;
+    const seed = Number(ANC.seed) || 1;
+    const R = makeRand(seed);
+    const sx = C.start.x + 0.5, sy = C.start.y + 0.5;
+    ["sparrow", "shiba", "cat", "butterfly", "rabbit", "duck"].forEach(function (kind, ki) {
+      const cfg = Object.assign({}, ANIMAL_DEFAULT[kind], ANC[kind] || {});
+      const K = ANIMAL_KIND[kind];
+      const count = Math.max(0, Math.floor(Number(cfg.count) || 0));
+      if (!count) return;
+      const area = cfg.area;
+      let cells = [];
+      for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+          if (area && (x < area.x || y < area.y || x >= area.x + area.w || y >= area.y + area.h)) continue;
+          if (animalCellFits(cfg.place, x, y)) cells.push({ x: x, y: y });
+        }
+      }
+      if (!cells.length) return;
+      // 住みかの候補：最初の位置から、反応する距離より離れた所（置いたとたんに逃げ出さないように）
+      let homes = cells.filter(function (c) { return Math.hypot(c.x + 0.5 - sx, c.y + 0.5 - sy) >= K.react + 1; });
+      if (kind === "cat") homes = homes.filter(function (c) { return buildingNear(c.x, c.y, 1); });        // 猫：建物のすぐそば
+      if (kind === "butterfly") homes = homes.filter(function (c) { return countTileNear(c.x, c.y, T.FLOWER, 2) >= 3; });   // 花の多い所
+      if (kind === "rabbit") homes = homes.filter(function (c) { return c.x >= 3 && c.y >= 3 && c.x <= COLS - 4 && c.y <= ROWS - 4; });   // 外周の林の際は避ける（見える所の林のそば）
+      if (!homes.length) homes = cells;
+      const flock = kind === "sparrow" ? { cx: 0, cy: 0, rnd: makeRand(seed * 7 + 13), cells: cells } : null;
+      const placed = [];
+      for (let i = 0; i < count; i++) {
+        const r = makeRand(seed * 1000 + ki * 100 + i + 1);
+        let home = null;
+        if (flock && i > 0) {
+          home = { x: flock.cx - 0.5, y: flock.cy - 0.5 };
+        } else {
+          for (let tries = 0; tries < 40 && !home; tries++) {     // 同じ種類どうしは、なるべく離して置く
+            const c = homes[Math.floor(R() * homes.length)];
+            const sep = { shiba: 6, cat: 4, rabbit: 5, duck: 1, butterfly: 1.5 }[kind] || 0;
+            if (tries < 30 && placed.some(function (p) { return Math.hypot(p.x - c.x, p.y - c.y) < sep; })) continue;
+            home = c;
+          }
+          if (!home) home = homes[0];
+          if (flock) { flock.cx = home.x + 0.5; flock.cy = home.y + 0.5; }
+        }
+        placed.push(home);
+        const a = {
+          kind: kind, variant: K.variants[i % K.variants.length], seed: r(), rnd: r,
+          x: home.x + 0.5, y: home.y + 0.5, h: 0, heading: r() * Math.PI * 2,
+          state: "idle", st: 0, dur: rndIn(r, 0.5, 2.5), phase: r(),
+          tx: 0, ty: 0, spd: 0, home: { x: home.x + 0.5, y: home.y + 0.5 }, cells: cells,
+          react: null, calm: 0, cool: 0, view: "side",
+          air: false, fx: 0, fy: 0, fk: 0, fh: 0, delay: -1, lift: 0, hBase: 0.6, landing: 0,
+          flock: flock, pond: null, cellSet: null
+        };
+        if (kind === "duck") a.pond = pondGroup(home.x, home.y);
+        // ふだん動き回る範囲：住みかから roam マスの中（アヒルは自分の池の中、スズメは広場全体）
+        const roam = { shiba: 8, cat: 4, rabbit: 4, butterfly: 3 }[kind];
+        if (kind === "duck") a.cells = cells.filter(function (c) { return a.pond.has(c.y * COLS + c.x); });
+        else if (roam) a.cells = cells.filter(function (c) { return Math.hypot(c.x - home.x, c.y - home.y) <= roam; });
+        if (!a.cells.length) a.cells = [home];
+        a.cellSet = new Set(a.cells.map(function (c) { return c.y * COLS + c.x; }));
+        if (flock && i > 0) {                            // 群れ：中心のまわりに散らばる
+          for (let t = 0; t < 12; t++) {
+            const ang = r() * Math.PI * 2, d = 0.3 + r() * 0.9;
+            const x = flock.cx + Math.cos(ang) * d, y = flock.cy + Math.sin(ang) * d;
+            if (animalOk(a, x, y)) { a.x = x; a.y = y; break; }
+          }
+        }
+        if (kind === "butterfly") { a.air = true; a.h = 0.6; a.state = "flutter"; a.dur = 99; a.tx = a.x; a.ty = a.y; }
+        if (kind === "duck") a.state = "idle";
+        animals.push(a);
+      }
+      if (flock) animalFlocks.push(flock);
+    });
+  }
+  createAnimals();
+
+  function animalSet(a, st, dur) {
+    a.state = st; a.st = 0; a.dur = dur;
+    if (st === "dabble") a.phase = 0;                   // 組み込みで追加：頭を水に入れる動きは、水面の上の姿（phase 0）から始める
+  }
+
+  // ふだん動く先を選ぶ（自分の住みかの場所の中で、まっすぐ行ける所）。見つからなければ null
+  function animalPickTarget(a, minD, maxD, cx, cy, within) {
+    const r = a.rnd;
+    for (let i = 0; i < 14; i++) {
+      let x, y;
+      if (within) {                                     // 中心 (cx,cy) から within マスの中
+        const ang = r() * Math.PI * 2, d = Math.sqrt(r()) * within;
+        x = cx + Math.cos(ang) * d; y = cy + Math.sin(ang) * d;
+        if (!a.cellSet.has(Math.floor(y) * COLS + Math.floor(x))) continue;   // 住みかの場所（place）の外へは行かない
+      } else {
+        const c = a.cells[Math.floor(r() * a.cells.length)];
+        x = c.x + 0.2 + r() * 0.6; y = c.y + 0.2 + r() * 0.6;
+      }
+      const d = Math.hypot(x - a.x, y - a.y);
+      if (d < minD || (d > maxD && i < 10)) continue;   // 最後の何回かは、遠くても住みかへ戻る道を許す
+      if (Math.hypot(x - player.x, y - player.y) < ANIMAL_KIND[a.kind].react + 0.3 && a.kind !== "shiba") continue;   // 主人公のすぐそばへは行かない
+      if (a.kind === "duck" && duckCrowded(a, x, y, 0.6)) continue;   // 確かめ後の手直し：ほかのアヒルのそばは選ばない
+      if (!animalOk(a, x, y) || !animalLineOk(a, a.x, a.y, x, y)) continue;
+      return { x: x, y: y };
+    }
+    return null;
+  }
+
+  // 主人公から離れる向きへ逃げる先（dist マスくらい）。見つからなければ null
+  function animalFleeTarget(a, dist) {
+    const away = Math.atan2(a.y - player.y, a.x - player.x);
+    const turns = [0, 0.45, -0.45, 0.9, -0.9, 1.35, -1.35];
+    const first = a.rnd() < 0.5 ? 1 : -1;               // 左右どちらから試すかも乱数で決める
+    for (let i = 0; i < turns.length; i++) {
+      for (let k = 1; k >= 0.5; k -= 0.25) {
+        const ang = away + turns[i] * first, d = dist * k;
+        const x = a.x + Math.cos(ang) * d, y = a.y + Math.sin(ang) * d;
+        if (animalOk(a, x, y) && animalLineOk(a, a.x, a.y, x, y)) return { x: x, y: y };
+      }
+    }
+    return null;
+  }
+
+  // 確かめ後の手直し：アヒルどうしが体ごと重ならないように。(x,y) が、ほかのアヒルの今の位置か泳いで行く先から r マスより近いか
+  function duckCrowded(a, x, y, r) {
+    for (let i = 0; i < animals.length; i++) {
+      const b = animals[i];
+      if (b === a || b.kind !== "duck") continue;
+      if (Math.hypot(b.x - x, b.y - y) < r) return true;
+      if (b.state === "swim" && Math.hypot(b.tx - x, b.ty - y) < r) return true;
+    }
+    return false;
+  }
+  // アヒルが (x,y) へ進むと、ほかのアヒルに体の長さ（約0.45マス）より近づきながら寄っていくか
+  function duckBumps(a, x, y) {
+    for (let i = 0; i < animals.length; i++) {
+      const b = animals[i];
+      if (b === a || b.kind !== "duck") continue;
+      const dn = Math.hypot(b.x - x, b.y - y);
+      if (dn < 0.45 && dn < Math.hypot(b.x - a.x, b.y - a.y)) return true;
+    }
+    return false;
+  }
+
+  function animalGo(a, t, spd, st) { a.tx = t.x; a.ty = t.y; a.spd = spd; animalSet(a, st, 99); }
+
+  // 目標 (tx,ty) へ進む。着いたら true。向きを大きく変えるときは、その場で向きを変えてから進む
+  function animalMove(a, dt) {
+    const dx = a.tx - a.x, dy = a.ty - a.y, dist = Math.hypot(dx, dy);
+    if (dist < 0.01) return true;
+    const K = ANIMAL_KIND[a.kind];
+    const diff = angDiff(Math.atan2(dy, dx), a.heading);
+    const turn = K.turn * dt * (a.spd > K.walk * 1.5 ? 2.2 : 1);
+    a.heading += clamp(diff, -turn, turn);
+    if (Math.abs(diff) > 1.3) return false;
+    const v = a.spd * dt * (0.35 + 0.65 * Math.max(0, Math.cos(diff)));
+    const k = Math.min(1, v / dist);
+    const nx = a.x + dx * k, ny = a.y + dy * k;
+    if (!animalOk(a, nx, ny)) { a.tx = a.x; a.ty = a.y; return true; }   // 念のため：収まらない所へは進まない
+    if (a.kind === "duck" && duckBumps(a, nx, ny)) { a.tx = a.x; a.ty = a.y; return true; }   // 確かめ後の手直し：ほかのアヒルにぶつかる手前で止まる
+    if (TRK.on && trickKeepOut(a, nx, ny)) { a.tx = a.x; a.ty = a.y; trickStats.stopped++; return true; }   // ★主人公の約0.5マスの中へは歩いて入らない（手前で止まる）
+    a.x = nx; a.y = ny;
+    return k >= 1;
+  }
+
+  // 向きを (x,y) のほうへ少しずつ変える
+  function animalFace(a, x, y, dt, rate) {
+    const diff = angDiff(Math.atan2(y - a.y, x - a.x), a.heading);
+    const turn = rate * dt;
+    a.heading += clamp(diff, -turn, turn);
+  }
+
+  // スズメの群れが飛び立つ。from＝逃げる相手（主人公。null なら気まぐれの引っ越し）
+  function flockTakeoff(fl, from) {
+    const r = fl.rnd;
+    let best = null, bestScore = -Infinity;
+    for (let i = 0; i < 24; i++) {
+      const c = fl.cells[Math.floor(r() * fl.cells.length)];
+      const x = c.x + 0.5, y = c.y + 0.5;
+      const dm = Math.hypot(x - fl.cx, y - fl.cy);
+      if (dm < 2.5 || dm > 7) continue;
+      if (TRK.on && trickLandBad(x, y)) continue;        // ★主人公のそば・これから通る道のりのそばには降りない
+      let score = r();
+      if (from) {
+        const dp = Math.hypot(x - from.x, y - from.y);
+        if (dp < 4.5) continue;
+        score += dp * 0.3;
+      }
+      if (score > bestScore) { bestScore = score; best = { x: x, y: y }; }
+    }
+    if (!best && from) {                                // 条件に合う所が無い：主人公からいちばん遠い所
+      fl.cells.forEach(function (c) {
+        const s = Math.hypot(c.x + 0.5 - from.x, c.y + 0.5 - from.y);
+        if (s > bestScore) { bestScore = s; best = { x: c.x + 0.5, y: c.y + 0.5 }; }
+      });
+    }
+    if (!best) return;
+    fl.cx = best.x; fl.cy = best.y;
+    animals.forEach(function (a) {
+      if (a.flock !== fl || a.air || a.delay >= 0) return;
+      let lx = fl.cx, ly = fl.cy;
+      for (let t = 0; t < 10; t++) {                    // 降りる所：群れの中心のまわりに散らばる
+        const ang = a.rnd() * Math.PI * 2, d = 0.25 + a.rnd() * 0.9;
+        const x = fl.cx + Math.cos(ang) * d, y = fl.cy + Math.sin(ang) * d;
+        if (animalOk(a, x, y)) { lx = x; ly = y; break; }
+      }
+      a.tx = lx; a.ty = ly;
+      a.delay = (from ? 0 : 0.3) + a.rnd() * 0.3;       // 1羽ずつ、少しずれて飛び立つ
+    });
+  }
+
+  // 主人公の位置から、アヒルの池までの距離（池のマスの四角までの近さ）
+  function pondDistance(a) {
+    let best = Infinity;
+    a.pond.forEach(function (k) {
+      const x = k % COLS, y = Math.floor(k / COLS);
+      const dx = Math.max(x - player.x, 0, player.x - (x + 1)), dy = Math.max(y - player.y, 0, player.y - (y + 1));
+      best = Math.min(best, Math.hypot(dx, dy));
+    });
+    return best;
+  }
+
+  // 動物を1匹、dt 秒ぶん動かす
+  function animalStep(a, dt) {
+    const K = ANIMAL_KIND[a.kind], r = a.rnd;
+    if (a.hold) { a.phase = (a.phase + dt * 0.5) % 1; return; }   // ★確かめ用（PORTAL_DEBUG.placeAnimal）：その場から動かさない
+    a.st += dt;
+    if (a.cool > 0) a.cool -= dt;
+    const d = Math.hypot(player.x - a.x, player.y - a.y);
+
+    switch (a.kind) {
+      case "sparrow": {
+        if (a.air) {                                    // 飛んでいる：弧を描いて、降りる所へ
+          a.fk = Math.min(1, a.fk + K.fly * dt / Math.max(0.5, a.fd));
+          a.x = lerp(a.fx, a.tx, a.fk); a.y = lerp(a.fy, a.ty, a.fk);
+          a.h = 4 * a.fk * (1 - a.fk) * a.fh;
+          if (a.fk >= 1) { a.air = false; a.h = 0; a.cool = 1.2; animalSet(a, "idle", rndIn(r, 0.3, 0.8)); }
+          break;
+        }
+        if (a.delay >= 0) {                             // 飛び立つ順番を待っている
+          a.delay -= dt;
+          if (a.delay < 0) {
+            a.air = true; a.fx = a.x; a.fy = a.y; a.fk = 0;
+            a.fd = Math.hypot(a.tx - a.x, a.ty - a.y);
+            a.fh = clamp(0.7 + a.fd * 0.18, 0.7, 2.0);
+            // 確かめ後の手直し：飛ぶ道の下に木のマスがあれば、その上で高さ約2.1マス（木のてっぺんより上）になる弧にする（高さの上限 3.2マス）
+            const n = Math.max(2, Math.ceil(a.fd / 0.1));
+            for (let i = 1; i < n; i++) {
+              const k = i / n;
+              if (tileAt(Math.floor(lerp(a.fx, a.tx, k)), Math.floor(lerp(a.fy, a.ty, k))) === T.TREE) a.fh = Math.max(a.fh, Math.min(3.2, 2.1 / (4 * k * (1 - k))));
+            }
+            a.heading = Math.atan2(a.ty - a.y, a.tx - a.x);
+            animalSet(a, "fly", 99);
+          }
+          break;
+        }
+        if (d < K.react && a.cool <= 0 && !trickBraced(a)) { flockTakeoff(a.flock, { x: player.x, y: player.y }); break; }   // 群れで飛び立つ（★跳ぶ相手の間は、板を弾く音まで待つ）
+        if (a.state === "hop") {
+          if (animalMove(a, dt)) animalSet(a, r() < 0.6 ? "peck" : "idle", rndIn(r, 0.4, 1.3));
+        } else if (a.st >= a.dur) {
+          const q = r();
+          if (q < 0.012) { flockTakeoff(a.flock, null); break; }   // ときどき、群れで別の所へ移る
+          if (q < 0.5) {
+            const t = animalPickTarget(a, 0.15, K.step, a.flock.cx, a.flock.cy, 1.3);
+            if (t) { animalGo(a, t, K.walk, "hop"); break; }
+          }
+          animalSet(a, q < 0.8 ? "peck" : "idle", rndIn(r, 0.4, 1.4));
+        }
+        break;
+      }
+      case "shiba": {
+        if (a.react === "wag") {                        // 主人公のほうを向いて、しっぽを振る（ついては行かない）
+          animalFace(a, player.x, player.y, dt, K.turn);
+          a.calm = d < K.react + 0.5 ? 0 : a.calm + dt;
+          if (a.calm > 1.5) { a.react = null; a.cool = 2; animalSet(a, "idle", rndIn(r, 1, 2.5)); break; }
+          // 確かめ後の手直し：しっぽを振るのは 8〜10秒まで。そのあとは主人公のほうを向いたまま 5〜9秒座り、
+          // ふだんの動きに戻る（15秒は、そばにいても、しっぽを振り直さない）
+          if (a.state === "wag" && a.st >= a.dur) animalSet(a, "sit", rndIn(r, 5, 9));
+          else if (a.state === "sit" && a.st >= a.dur) { a.react = null; a.cool = 15; animalSet(a, "idle", rndIn(r, 1, 2.5)); }
+          break;
+        }
+        if (d < K.react && a.cool <= 0) { a.react = "wag"; a.calm = 0; animalSet(a, "wag", rndIn(r, 8, 10)); break; }
+        if (a.state === "walk" || a.state === "run") {
+          if (animalMove(a, dt)) animalSet(a, r() < 0.3 ? "sit" : "idle", r() < 0.3 ? rndIn(r, 5, 12) : rndIn(r, 1.5, 4));
+        } else if (a.st >= a.dur) {
+          const q = r();
+          if (q < 0.6) {
+            const run = q < 0.08;
+            const t = animalPickTarget(a, run ? 3 : 1.2, run ? 6 : K.step, 0, 0, 0);
+            if (t) { animalGo(a, t, run ? K.run : K.walk, run ? "run" : "walk"); break; }
+          }
+          if (a.state === "sit") animalSet(a, "idle", rndIn(r, 1.5, 4));
+          else animalSet(a, q < 0.85 ? "sit" : "idle", q < 0.85 ? rndIn(r, 5, 12) : rndIn(r, 2, 4));
+        }
+        break;
+      }
+      case "cat": {
+        if (a.react === "flee") {                       // 主人公から離れる向きへ少し走って、また座る
+          if (animalMove(a, dt)) { a.react = null; a.cool = 2.5; animalSet(a, "sit", rndIn(r, 4, 9)); }
+          break;
+        }
+        if (d < K.react && a.cool <= 0 && !trickBraced(a)) {   // ★跳ぶ相手の間は、着地まで逃げない
+          const t = animalFleeTarget(a, rndIn(r, 1.6, 2.6));
+          if (t) { a.react = "flee"; animalGo(a, t, K.run, "run"); break; }
+          a.cool = 1;
+        }
+        if (a.state === "walk") {
+          if (animalMove(a, dt)) animalSet(a, r() < 0.5 ? "sit" : "idle", rndIn(r, 2, 6));
+        } else if (a.st >= a.dur) {
+          const q = r();
+          if (a.state === "sit" && q < 0.4) { animalSet(a, "groom", rndIn(r, 3, 6)); break; }
+          if (a.state === "groom") { animalSet(a, "sit", rndIn(r, 3, 8)); break; }
+          if (q < 0.5) {
+            const t = animalPickTarget(a, 0.8, K.step, 0, 0, 0);
+            if (t) { animalGo(a, t, K.walk, "walk"); break; }
+          }
+          animalSet(a, q < 0.85 ? "sit" : "idle", q < 0.85 ? rndIn(r, 5, 12) : rndIn(r, 1.5, 4));
+        }
+        break;
+      }
+      case "rabbit": {
+        if (a.react === "flee") {                       // 跳ねて逃げる
+          if (animalMove(a, dt)) { a.react = "alert"; a.calm = 0; animalSet(a, "alert", 99); }
+          break;
+        }
+        if (d < 1.8 && a.cool <= 0 && !trickBraced(a)) {   // ★跳ぶ相手の間は、耳を立てて止まったまま（着地まで逃げない）
+          const t = animalFleeTarget(a, rndIn(r, 2.8, 4));
+          if (t) { a.react = "flee"; animalGo(a, t, K.run, "hop"); break; }
+          a.cool = 0.8;
+        }
+        if (a.react === "alert") {                      // 耳を立てて止まる（主人公が離れて1秒たつまで）
+          a.calm = d < K.react ? 0 : a.calm + dt;
+          if (a.calm > 1) { a.react = null; a.cool = 0.5; animalSet(a, "idle", rndIn(r, 1.5, 3)); }
+          break;
+        }
+        if (d < K.react) { a.react = "alert"; a.calm = 0; animalSet(a, "alert", 99); break; }
+        if (a.state === "hop") {
+          if (animalMove(a, dt)) animalSet(a, "idle", rndIn(r, 1.5, 4));
+        } else if (a.st >= a.dur) {
+          const q = r();
+          if (q < 0.55) {
+            const t = animalPickTarget(a, 0.8, K.step, 0, 0, 0);
+            if (t) { animalGo(a, t, K.walk, "hop"); break; }
+          }
+          animalSet(a, q < 0.68 ? "alert" : "idle", q < 0.68 ? rndIn(r, 1, 2) : rndIn(r, 2, 5));
+        }
+        break;
+      }
+      case "duck": {
+        if (a.react === "flee") {                       // 反対側へ泳ぐ
+          if (animalMove(a, dt)) { a.react = null; a.cool = 3; animalSet(a, "idle", rndIn(r, 2, 4)); }
+          break;
+        }
+        if (a.cool <= 0 && d < 6 && pondDistance(a) < K.react) {   // 主人公が池のふちに来た
+          let best = null, bd = -1;
+          a.pond.forEach(function (k) {
+            const x = k % COLS + 0.5, y = Math.floor(k / COLS) + 0.5;
+            const s = Math.hypot(x - player.x, y - player.y);
+            if (s > bd && animalOk(a, x, y) && !duckCrowded(a, x, y, 0.6) && animalLineOk(a, a.x, a.y, x, y)) { bd = s; best = { x: x, y: y }; }   // 確かめ後の手直し：ほかのアヒルのそばは選ばない
+          });
+          if (best && Math.hypot(best.x - a.x, best.y - a.y) > 0.6) { a.react = "flee"; animalGo(a, best, K.run, "swim"); break; }
+          a.cool = 1.5;
+        }
+        if (a.state === "swim") {
+          if (animalMove(a, dt)) animalSet(a, r() < 0.4 ? "dabble" : "idle", rndIn(r, 1.5, 4));
+        } else {
+          if (a.state === "idle") a.heading += Math.sin(state.time * 0.4 + a.seed * 9) * 0.15 * dt;   // 浮かんで、ゆっくり向きが変わる
+          if (a.st >= a.dur) {
+            const q = r();
+            if (q < 0.55) {
+              const t = animalPickTarget(a, 0.8, K.step, 0, 0, 0);
+              if (t) { animalGo(a, t, K.walk, "swim"); break; }
+            }
+            animalSet(a, q < 0.8 ? "dabble" : "idle", q < 0.8 ? rndIn(r, 1.5, 3) : rndIn(r, 2, 5));
+          }
+        }
+        break;
+      }
+      case "butterfly": {
+        if (d < K.react && a.cool <= 0) {               // 少し高く舞い上がって、離れる
+          a.lift = rndIn(r, 2, 3); a.cool = 3.5; a.landing = 0;
+          const t = animalFleeTarget(a, rndIn(r, 1.2, 2));
+          if (t) { a.tx = t.x; a.ty = t.y; }
+          animalSet(a, "flutter", 99);
+        }
+        if (a.lift > 0) a.lift -= dt;
+        let want;
+        if (a.state === "idle") {                       // 花にとまる
+          want = 0.12;
+          if (a.st >= a.dur) { const t = animalPickTarget(a, 0.5, K.step, a.home.x, a.home.y, 2.5); if (t) { a.tx = t.x; a.ty = t.y; } animalSet(a, "flutter", 99); }
+        } else if (a.landing > 0) {                     // 確かめ後の手直し：花へ下りる間は羽ばたいたまま。下りきってから羽を閉じる（idle）
+          want = 0.12;
+          if (a.h < 0.16) { animalSet(a, "idle", a.landing); a.landing = 0; }
+        } else {
+          want = a.hBase + Math.sin(state.time * 2.1 + a.seed * 7) * 0.12 + (a.lift > 0 ? 0.9 : 0);
+          // ひらひら：目標へ向かいながら、向きが揺れる
+          const dx = a.tx - a.x, dy = a.ty - a.y, dist = Math.hypot(dx, dy);
+          if (dist < 0.2) {
+            if (r() < 0.25 && a.lift <= 0 && tileAt(Math.floor(a.x), Math.floor(a.y)) === T.FLOWER) { a.landing = rndIn(r, 2, 5); }   // とまる時間を覚えて、下り始める
+            else {
+              const t = animalPickTarget(a, 0.5, K.step, a.home.x, a.home.y, 2.5);
+              if (t) { a.tx = t.x; a.ty = t.y; a.hBase = rndIn(r, 0.4, 0.9); }
+            }
+          } else {
+            const wob = Math.sin(state.time * 3.3 + a.seed * 11) * 1.1 + Math.sin(state.time * 7.1 + a.seed * 5) * 0.5;
+            const diff = angDiff(Math.atan2(dy, dx) + wob * 0.6, a.heading);
+            a.heading += clamp(diff, -K.turn * dt * 2, K.turn * dt * 2);
+            const v = (a.lift > 0 ? K.run : K.walk) * dt;
+            const nx = a.x + Math.cos(a.heading) * v, ny = a.y + Math.sin(a.heading) * v;
+            if (animalOk(a, nx, ny)) { a.x = nx; a.y = ny; }
+            else { a.heading += Math.PI * 0.5; a.tx = a.home.x; a.ty = a.home.y; }   // 木や建物に当たりそう：向きを変えて住みかへ
+          }
+        }
+        a.h += (want - a.h) * (1 - Math.exp(-dt * 2.5));
+        break;
+      }
+    }
+
+    // 周期（足の運び・羽ばたきなど）を進める
+    let rate;
+    if (a.state === "fly") rate = 11;
+    else if (a.state === "flutter") rate = 7;
+    else if (a.state === "walk" || a.state === "run" || a.state === "hop" || a.state === "swim") rate = Math.max(1.2, a.spd / (a.spd > K.walk * 1.5 ? (K.runStride || K.stride * 1.8) : K.stride));
+    else if (a.state === "dabble") rate = 1 / Math.max(0.5, a.dur);   // 組み込みで追加：頭を水に入れる→戻るを、続く時間でちょうど1回（絵の決まり：dabble は phase 0〜1 で1回）
+    else if (a.state === "wag") rate = 4;
+    else if (a.state === "peck") rate = 2.5;
+    else if (a.state === "groom") rate = 1.2;
+    else rate = 0.5;
+    a.phase = (a.phase + dt * rate) % 1;
+  }
+
+  // 動物を dt 秒ぶん動かす（大きな dt は 0.05 秒ずつに分ける。同じ step の進め方なら、毎回同じ動きになる）
+  function updateAnimals(dt) {
+    if (!animals.length) return;
+    let left = dt;
+    while (left > 1e-9) {
+      const h = Math.min(left, 0.05);
+      left -= h;
+      for (let i = 0; i < animals.length; i++) {
+        animalStep(animals[i], h);
+        if (TRK.on) trickPushAway(animals[i]);          // ★主人公と重ならないように、すぐそばの動物は押しのける
+      }
+    }
+  }
+
+  // カメラから見た動物の向き。look＝カメラが見ている水平の向き。
+  // view＝"side"｜"front"｜"back"（切り替わりの所で絵がちらつかないよう、少しのり代を持たせる）、flip＝左向き（絵を左右反転する）
+  function animalFacing(a, look, keep) {
+    const rel = angDiff(a.heading, look), ab = Math.abs(rel);
+    let v = keep ? a.view : "";
+    const stay = v === "back" ? ab < 0.85 : (v === "front" ? ab > 2.29 : (v === "side" ? ab > 0.55 && ab < 2.59 : false));
+    if (!stay) v = ab < 0.7 ? "back" : (ab > 2.44 ? "front" : "side");
+    if (keep) a.view = v;
+    return { view: v, flip: rel < 0 };
+  }
+
+  // 動物の絵を1つ描く（x,y＝足元の画面上の位置、s＝絵の拡大率）
+  const animalWarned = new Set();
+  function drawAnimalSprite(g, a, art, x, y, s, f, now) {
+    g.save();
+    g.translate(x, y);
+    g.scale(f.flip ? -s : s, s);
+    try {
+      art.draw(g, { state: animalArtState(art, a.state), phase: a.phase, t: now, view: f.view, seed: a.seed, variant: a.variant });
+    } catch (e) {                                       // 絵の関数の書き間違いで、ゲーム全体が止まらないようにする（知らせは1回だけ）
+      if (!animalWarned.has(a.kind)) { animalWarned.add(a.kind); console.warn("動物の絵（" + a.kind + "）を描けません：" + e); }
+    }
+    g.restore();
+  }
+
+  // 影の大きさ（マス）：体の長さの半分を少し縮めた楕円。高く飛ぶほど小さく・薄く
+  function animalShadowSize(a, art) {
+    const up = clamp(a.h / 2.5, 0, 0.7);
+    const L = art.size.w * 0.42 / ART_PX * (1 - up * 0.4);
+    return { L: L, W: L * (a.kind === "butterfly" ? 0.8 : 0.5), alpha: 0.22 * (1 - up) * (a.kind === "butterfly" ? 0.5 : 1) };
+  }
+
+  // 斜め見下ろしの画面で、動物を1匹描く（g は斜め画面の座標に合わせてある）
+  function drawAnimalIso(g, a, now) {
+    const art = ANIMAL_ART[a.kind];
+    if (!art) return;
+    const p = iso(a.x, a.y);
+    if (a.kind !== "duck") {                            // 影（アヒルは水の上なので、影の代わりに絵の側の波紋）
+      const sh = animalShadowSize(a, art);
+      g.save();
+      g.translate(p.x, p.y);
+      g.transform(TW / 2, TH / 2, -TW / 2, TH / 2, 0, 0);   // 地図の向き（マス）のまま描く
+      g.rotate(a.heading);
+      g.beginPath(); g.ellipse(0, 0, sh.L, sh.W, 0, 0, Math.PI * 2);
+      g.fillStyle = "rgba(0,0,0," + sh.alpha.toFixed(3) + ")";
+      g.fill();
+      g.restore();
+    }
+    drawAnimalSprite(g, a, art, p.x, p.y - a.h * ART_PX, 1, animalFacing(a, ISO_VIEW, true), now);
+  }
+
+  // 背中ごしの画面で、動物の絵の位置と拡大率。見えない（カメラのすぐそば・画面の外・遠すぎる）ときは null
+  function animalBoxFollow(a) {
+    const art = ANIMAL_ART[a.kind];
+    if (!art) return null;
+    const q = project(a.x, a.y, a.h);
+    if (q.z < 0.9 || q.z > 32) return null;
+    const s = fcam.f / q.z / ART_PX;
+    const w = art.size.w * s, h = art.size.h * s;
+    if (q.x + w < 0 || q.x - w > viewW || q.y - h > viewH || q.y + h * 0.3 < 0) return null;
+    return { x: q.x, y: q.y, z: q.z, s: s };
+  }
+
+  // 背中ごしの画面で、動物を1匹描く（it＝{ animal, bb }）
+  function drawAnimalFollow(it, now) {
+    const a = it.animal, art = ANIMAL_ART[a.kind], bb = it.bb;
+    if (a.kind !== "duck") {                            // 地面の影（体の向きに長い楕円を、地面の上に写す）
+      const sh = animalShadowSize(a, art), pts = [];
+      const hx = Math.cos(a.heading), hy = Math.sin(a.heading);
+      for (let i = 0; i < 12; i++) {
+        const t = i / 12 * Math.PI * 2, u = Math.cos(t) * sh.L, v = Math.sin(t) * sh.W;
+        pts.push([a.x + hx * u - hy * v, a.y + hy * u + hx * v]);
+      }
+      if (groundPath(pts)) { ctx.fillStyle = "rgba(0,0,0," + sh.alpha.toFixed(3) + ")"; ctx.fill(); }
+    }
+    // 組み込みで変更：向きは、カメラの正面の向きではなく「カメラから動物を見る向き」で決める
+    // （画面の端の動物は斜めから見えるので、正面の向きで決めると、こちらへ来る動物が横向きの絵になることがある）
+    drawAnimalSprite(ctx, a, art, bb.x, bb.y, bb.s, animalFacing(a, Math.atan2(a.y - fcam.ey, a.x - fcam.ex), true), now);
+  }
+
+  // 背中ごしの画面：描く物の並び（奥から順）に、動物を入れる。
+  // 動物より奥の物＝木・動物・主人公は奥行きで、建物は「カメラから動物への線が、建物の土台を横切らない」もの。
+  // 動物は、奥の物のうち最後の物の直後に入れる
+  function addAnimalsFollow(items, playerZ) {
+    const c = fcam, list = [];
+    animals.forEach(function (a) {
+      const bb = animalBoxFollow(a);
+      if (bb) list.push({ animal: a, bb: bb, z: bb.z });
+    });
+    list.sort(function (p, q) { return q.z - p.z; });
+    list.forEach(function (an) {
+      const a = an.animal;
+      let at = 0;
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        let behind;
+        if (it.animal) behind = it.z >= an.z;
+        else if (it.player) behind = playerZ >= an.z;
+        else if (it.b) behind = rayRectEnter(c.ex, c.ey, a.x - c.ex, a.y - c.ey, it.b.x, it.b.y, it.b.x + it.b.size, it.b.y + it.b.size) >= 1;
+        else behind = it.z >= an.z;
+        if (behind) at = i + 1;
+      }
+      items.splice(at, 0, an);
+    });
   }
 
   // ------------------------------------------------------------
@@ -2786,7 +6407,12 @@
       const p = iso(it.tree.x, it.tree.y);
       return p.x > minX - 40 && p.x < maxX + 40 && p.y > minY && p.y < maxY + 80;
     });
-    items.push({ key: player.x + player.y + 0.001, draw: function () { Art.isoPlayer(ctx, player, now); } });
+    animals.forEach(function (a) {                      // 動物（足元の x＋y で、奥から順の並びに入れる。画面の外は描かない）
+      const p = iso(a.x, a.y);
+      if (p.x < minX || p.x > maxX || p.y < minY || p.y > maxY + 40) return;
+      items.push({ key: a.x + a.y, draw: function () { drawAnimalIso(ctx, a, now); } });
+    });
+    items.push({ key: player.x + player.y + 0.001 + (player.trick ? trickAir(player) * 2 : 0), draw: function () { Art.isoPlayer(ctx, player, now); } });   // ★跳んでいる間は、真下の動物より後に描く（上にいるので）
     items.sort(function (a, b) { return a.key - b.key; });
     for (let i = 0; i < items.length; i++) items[i].draw(now);
   }
@@ -3004,8 +6630,13 @@
 
     // 位置：主人公を少し遅れて追う
     const k = 1 - Math.exp(-dt * CAMC.followRate);
-    c.px += (p.x - c.px) * k;
-    c.py += (p.y - c.py) * k;
+    if (p.carve) {                                      // ★カーブでよけている間は、横へずれた分の半分だけ追う（カメラが大きく揺れないように）
+      c.px += (p.x - p.carveOx * 0.5 - c.px) * k;
+      c.py += (p.y - p.carveOy * 0.5 - c.py) * k;
+    } else {
+      c.px += (p.x - c.px) * k;
+      c.py += (p.y - c.py) * k;
+    }
 
     // 速さ（引きと視野の味付けに使う）
     c.spd += (clamp(p.speed / full, 0, 1) - c.spd) * (1 - Math.exp(-dt * 2.2));
@@ -3025,7 +6656,8 @@
 
     // 向き：主人公の向きを少し遅れて追う（曲がり角で、景色がぐるっと回る）。到着の構図では、建物を見せる向き
     // （板に乗る間は、体の向きが大きく回る。その向きではなく、これから進む向きを追う）
-    const face = (p.mode === "mount" && p.route && p.route.total > 0.01) ? routeAt(p.route, 0).ang : p.heading;
+    let face = (p.mode === "mount" && p.route && p.route.total > 0.01) ? routeAt(p.route, 0).ang : p.heading;
+    if (p.carve) face -= p.carveYaw;                    // ★カーブでよけている間は、体の向きではなく道のりの向きを追う
     let want = near ? arriveYaw(b) : face;
     want = safeYaw(c.px, c.py, want, c.yaw, CAMC.minDistance);      // 建物にめり込む向きは避ける
     // ばねで引くように追わせる：回り始めと回り終わりがゆるやかになり、カクッと回らない。回る速さには上限を付ける
@@ -3073,6 +6705,7 @@
     // 見る先＝主人公の少し前。到着の構図では、主人公と建物の間（少し高め）。
     // 手で見回している間は、建物へ寄せる量を減らす（見回した向きの前方を見る）
     let tx = c.px + cs * CAMC.lookAhead, ty = c.py + sn * CAMC.lookAhead, tz = CAMC.lookHeight;
+    if (player.trick) { const air = trickAir(player); c.ez += air * 0.25; tz += air * 0.3; }   // ★跳んでいる間は、その高さに少しだけついていく
     const ab = a * (1 - c.omix);
     if (ab > 0 && c.arrB) {
       const b = c.arrB;
@@ -5557,6 +9190,7 @@
     modelOrderFix(back, c.ex, c.ey);                    // 立体の建物どうしは、土台の離れている向きで前後を決め直す
     modelOrderFix(front, c.ex, c.ey);
     const items = back.concat([{ player: true }], front);
+    if (animals.length) addAnimalsFollow(items, pb.z);  // 動物を、奥から順の並びに入れる
 
     // 主人公の体の3点（足元・腰・頭）。手前の建物の絵が、この点に重なっているかを調べる
     const body = [project(p.x, p.y, 0.1), project(p.x, p.y, 0.75), project(p.x, p.y, 1.35)];
@@ -5577,6 +9211,7 @@
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
       if (it.player) { followPlayer(now); continue; }
+      if (it.animal) { drawAnimalFollow(it, now); continue; }
       // 主人公より手前にあって、主人公に重なる物は、半透明にする。カメラのすぐ前の物も薄くする
       const bb = it.bb;
       let covers = false, hide = false;
@@ -6041,6 +9676,7 @@
   function update(dt) {
     state.time += dt;
     updatePlayer(dt);
+    updateAnimals(dt);                                  // 動物（animals.enabled が false なら何もしない）
     panByKeys(dt);
     updateCamera(dt);
   }
@@ -6132,11 +9768,52 @@
       return { x0: r.left + bb.x0, y0: r.top + bb.y0, x1: r.left + bb.x1, y1: r.top + bb.y1, depth: bb.z };
     },
     lookAround: function (rad) { lookAround(rad); },            // 見回す（＋で右へ、－で左へ。ラジアン）
+    animals: function () {                                      // 動物の一覧（種類・毛色・位置・高さ・状態・反応・向き）。向きは、いまのカメラから見た向き
+      if (camMode === "follow") followFrame();
+      const look = camMode === "follow" ? fcam.look : ISO_VIEW;
+      return animals.map(function (a) {
+        const f = animalFacing(a, camMode === "follow" ? Math.atan2(a.y - fcam.ey, a.x - fcam.ex) : look, false);   // 組み込みで変更：描く所と同じ決め方
+        return { kind: a.kind, variant: a.variant, x: +a.x.toFixed(3), y: +a.y.toFixed(3), h: +a.h.toFixed(3), state: a.state, react: a.react || "", heading: +a.heading.toFixed(3), view: f.view, flip: f.flip,
+                 air: !!a.air };                         // ★air＝空を飛んでいるか（技の確かめ用に足した）
+      });
+    },
+    animalArt: ANIMAL_ART,                                      // 動物の絵の置き場（確かめ用）
     buildingAlpha: function (b) {                               // 背中ごしの画面で、建物をどれだけ見せているか（0＝近すぎて消している 〜 1。主人公を隠すときの半透明は含まない）
       followFrame();
       const bb = followBox(b);
       return bb ? nearFade({ b: b }, bb) : 0;
-    }
+    },
+    // ---- ここから下は、技（tricks）で足した物 ----
+    tricksOn: function () { return TRK.on; },                  // 技が入っているか（config.js の tricks.enabled）
+    trick: function () {                                        // いま出している技（種類・段階・進み具合・板の高さ）と、カーブ
+      const p = player, tr = p.trick;
+      let t = null, cv = null;
+      if (tr) {
+        const ph = trickPhase(tr), bd = trickBoard(tr), all = tr.Tc + tr.Ta + tr.Tl;
+        t = { kind: tr.kind, phase: ph.name, phaseK: +ph.k.toFixed(3), progress: +clamp(tr.t / all, 0, 1).toFixed(3), t: +tr.t.toFixed(3),
+              height: +trickAir(p).toFixed(3), H: +tr.H.toFixed(3), airTime: +tr.Ta.toFixed(3), pitch: +bd.pitch.toFixed(3), flip: +bd.flip.toFixed(3),
+              target: tr.target ? tr.target.kind : "" };
+      }
+      if (p.carve) {
+        const o = trickCarveAt(p.carve, p.dist);
+        cv = { offset: +o.off.toFixed(3), O: +p.carve.O.toFixed(3), s0: +p.carve.s0.toFixed(2), s3: +p.carve.s3.toFixed(2), target: p.carve.target ? p.carve.target.kind : "" };
+      }
+      return { trick: t, carve: cv, inAir: trickInAir(p) };
+    },
+    trickStats: trickStats,                                     // 技の回数の記録（ollie・kickflip・carve・押しのけ など）と、最近の出来事
+    placeAnimal: function (which, x, y, opt) {                  // 確かめ用：動物を (x,y) に置く。which＝一覧の番号か種類の名前。opt.hold＝false でなければ、その場から動かさない
+      const o = opt || {};
+      const a = typeof which === "number" ? animals[which] : animals.filter(function (q) { return q.kind === which; })[o.nth || 0];
+      if (!a) return -1;
+      a.x = x; a.y = y; a.tx = x; a.ty = y; a.h = 0; a.air = false; a.delay = -1; a.react = null; a.cool = 0;
+      if (typeof o.heading === "number") a.heading = o.heading;
+      animalSet(a, o.state || (a.kind === "sparrow" ? "peck" : "sit"), 99);
+      a.hold = o.hold !== false && !o.goto;
+      if (typeof o.cool === "number") a.cool = o.cool;          // opt.cool＝主人公に反応しない秒数
+      if (o.goto) animalGo(a, { x: o.goto[0], y: o.goto[1] }, ANIMAL_KIND[a.kind].walk, a.kind === "sparrow" || a.kind === "rabbit" ? "hop" : "walk");   // opt.goto＝[x,y] へ歩かせる
+      return animals.indexOf(a);
+    },
+    releaseAnimal: function (i) { if (animals[i]) { animals[i].hold = false; animals[i].st = 99; } }
   };
 
   // 始められなかったときは、index.html の最後の処理が案内を出す（下のリンク一覧は使える）
