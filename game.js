@@ -6083,29 +6083,44 @@
     drawAnimalSprite(ctx, a, art, bb.x, bb.y, bb.s, animalFacing(a, Math.atan2(a.y - fcam.ey, a.x - fcam.ex), true), now);
   }
 
+  // 背中ごしの画面で、動物の絵（と足元の影）が入る四角
+  function animalRectFollow(an) {
+    const art = ANIMAL_ART[an.animal.kind], bb = an.bb;
+    const w = art.size.w * bb.s, h = art.size.h * bb.s;
+    return { x0: bb.x - w * 0.6, x1: bb.x + w * 0.6, y0: bb.y - h * 1.05, y1: bb.y + h * 0.25 };
+  }
+
   // 背中ごしの画面：描く物の並び（奥から順）に、動物を入れる。
-  // 動物より奥の物＝木・動物・主人公は奥行きで、建物は「カメラから動物への線が、建物の土台を横切らない」もの。
-  // 動物は、奥の物のうち最後の物の直後に入れる
-  function addAnimalsFollow(items, playerZ) {
+  // 前後を決めるのは、画面で動物に重なる物だけ（重ならない物は、どちらが先でも絵は同じ）。
+  //   動物より奥＝木・動物・主人公は奥行きで、建物は「カメラから動物への線が、建物の土台を横切らない」もの。
+  // 動物は「重なる奥の物」の後、「重なる手前の物」の前に入れる。両方を満たせない時は、手前の物の前に入れる
+  // （手前の物に隠れるはずの動物が、その上に描かれないことを優先する）。
+  // 以前は「奥の物のうち、並びの最後の物の直後」に入れていたため、画面の横にある手前の建物（線が土台を横切らないので
+  // 「奥」と判定される）まで押し出され、手前の木の上に動物が描かれることがあった
+  function addAnimalsFollow(items, pb) {
     const c = fcam, list = [];
     animals.forEach(function (a) {
       const bb = animalBoxFollow(a);
       if (bb) list.push({ animal: a, bb: bb, z: bb.z });
     });
     list.sort(function (p, q) { return q.z - p.z; });
+    const hit = function (p, q) { return p.x0 < q.x1 && p.x1 > q.x0 && p.y0 < q.y1 && p.y1 > q.y0; };
     list.forEach(function (an) {
-      const a = an.animal;
-      let at = 0;
+      const a = an.animal, r = animalRectFollow(an);
+      let lo = 0, firstFront = -1;                      // lo＝重なる奥の物の最後の次、firstFront＝重なる手前の物の最初
       for (let i = 0; i < items.length; i++) {
         const it = items[i];
+        const box = it.player ? pb : it.animal ? animalRectFollow(it) : it.bb;
+        if (!box || !hit(box, r)) continue;
         let behind;
         if (it.animal) behind = it.z >= an.z;
-        else if (it.player) behind = playerZ >= an.z;
+        else if (it.player) behind = pb.z >= an.z;
         else if (it.b) behind = rayRectEnter(c.ex, c.ey, a.x - c.ex, a.y - c.ey, it.b.x, it.b.y, it.b.x + it.b.size, it.b.y + it.b.size) >= 1;
         else behind = it.z >= an.z;
-        if (behind) at = i + 1;
+        if (behind) lo = i + 1;
+        else if (firstFront < 0) firstFront = i;
       }
-      items.splice(at, 0, an);
+      items.splice(firstFront >= 0 && firstFront < lo ? firstFront : lo, 0, an);
     });
   }
 
@@ -9190,7 +9205,7 @@
     modelOrderFix(back, c.ex, c.ey);                    // 立体の建物どうしは、土台の離れている向きで前後を決め直す
     modelOrderFix(front, c.ex, c.ey);
     const items = back.concat([{ player: true }], front);
-    if (animals.length) addAnimalsFollow(items, pb.z);  // 動物を、奥から順の並びに入れる
+    if (animals.length) addAnimalsFollow(items, pb);    // 動物を、奥から順の並びに入れる
 
     // 主人公の体の3点（足元・腰・頭）。手前の建物の絵が、この点に重なっているかを調べる
     const body = [project(p.x, p.y, 0.1), project(p.x, p.y, 0.75), project(p.x, p.y, 1.35)];
